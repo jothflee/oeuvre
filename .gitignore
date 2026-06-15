@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Oeuvre runtime artifacts / data (these live in the workspace, not the repo)
+_sho_work/
+_solve_tmp/
+siril_workspace*/
+*.fit
+*.fits
+*.fts
+*.tif
+*.tiff
