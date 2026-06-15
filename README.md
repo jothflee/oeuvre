@@ -32,6 +32,11 @@ uv sync          # create the venv and install deps
 
 Or with pip: `pip install .`
 
+**Desktop app (macOS):** `bash tools/make_macos_app.sh` builds a double-clickable
+`Oeuvre.app` (with icon) — drag it to `/Applications`. Pre-built standalone
+bundles for macOS and Linux are also attached to each
+[GitHub Release](https://github.com/jothflee/oeuvre/releases).
+
 ## Data location (workspace)
 
 Code and data are separate. The **workspace** is the data root — target
@@ -68,6 +73,18 @@ uv run oeuvre NGC6888 --headless --no-preprocess   # reuse existing masters
    correction, 2-pass asterism registration, Winsorized-σ stacking (`preprocess`)
 3. SHO Hubble-palette processing: channel alignment, linked arcsinh stretch,
    star removal, SCNR, color, recombine (`natural_narrowband`)
+
+## Output files
+
+Each run writes three files to the target directory. The pipeline stays
+floating-point throughout and is preserved as far as each format allows —
+nothing is truncated to 8-bit:
+
+- **`SHO_*.fits`** — 32-bit float + WCS. Full-precision archival master / for reprocessing.
+- **`SHO_*.tiff`** — 16-bit RGB. Fidelity-first deliverable for editing and printing.
+- **`SHO_*.png`** — 16-bit RGB. High-fidelity preview; zooms cleanly (no 8-bit banding). Down-convert from this for 8-bit-only sharing targets.
+
+A `SHO_*_provenance.txt` sidecar records the processing parameters.
 
 ## Development
 

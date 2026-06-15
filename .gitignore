@@ -12,6 +12,13 @@ env/
 # macOS
 .DS_Store
 
+# Build artifacts (regenerated from oeuvre/assets/icon.png + tools/)
+Oeuvre.app/
+*.icns
+*.iconset/
+build/
+dist/
+
 # Oeuvre runtime artifacts / data (these live in the workspace, not the repo)
 _sho_work/
 _solve_tmp/

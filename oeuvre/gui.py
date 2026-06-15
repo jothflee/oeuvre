@@ -7,28 +7,34 @@ an embedded image preview that replaces the cv2 preview windows.
 """
 
 import os
+import io
+import base64
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext
 
 import numpy as np
-from PIL import Image, ImageTk, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 from .pipeline import run_pipeline, scan_targets, PipelineConfig
 from .config import workspace
 from .projection import SkyMap
+from .starfield import render_starfield
+from .projection import _feather_mask
 
 
-# ── Colour palette ──────────────────────────────────────────────────────────
+# ── Colour palette (deep-space / frosted glass) ──────────────────────────────
 
-BG         = '#1e1e2e'
-BG_LIGHT   = '#2a2a3d'
-FG         = '#cdd6f4'
+SPACE      = '#06070e'   # canvas behind the starfield
+BG         = '#0a0c14'   # widget/frame fill — nearly deep space, so it vanishes
+BG_LIGHT   = '#0b0e16'   # inner surfaces (log text)
+GLASS_EDGE = '#39435c'   # hairline panel edge
+FG         = '#eef2ff'   # white text floating on the stars
 ACCENT     = '#89b4fa'
 ACCENT2    = '#a6e3a1'
 WARN       = '#fab387'
 ERR        = '#f38ba8'
-DIM        = '#6c7086'
+DIM        = '#9aa4be'   # dimmed white
 FONT       = ('SF Mono', 12)
 FONT_TITLE = ('SF Pro Display', 18, 'bold')
 FONT_SMALL = ('SF Mono', 11)
@@ -36,6 +42,18 @@ FONT_LOG   = ('SF Mono', 10)
 
 PREVIEW_MIN_W = 800
 PREVIEW_MIN_H = 600
+
+
+def _to_photo(pil_img):
+    """PIL image -> Tk PhotoImage via PNG bytes.
+
+    Avoids Pillow's ImageTk, whose `_imagingtk` C extension fails to register
+    with Tk on uv / python-build-standalone interpreters ("invalid command name
+    PyImagingPhoto"). Tk 8.6 reads PNG natively, so this works everywhere.
+    """
+    buf = io.BytesIO()
+    pil_img.convert('RGB').save(buf, format='PNG')
+    return tk.PhotoImage(data=base64.b64encode(buf.getvalue()).decode('ascii'))
 
 
 # ── TkPreview — drop-in replacement for PipelinePreview ─────────────────────
@@ -62,6 +80,8 @@ class TkPreview:
         self._placeholder = placeholder_label  # hidden on first image
         self._tk_photo = None  # prevent GC
         self._canvas_image_id = None
+        self._bg_pil = None       # starfield the preview feathers onto
+        self._content = None      # last image shown (PIL)
         self._n_panels = 0
         self._grid_cols = 0
         self._grid_rows = 0
@@ -131,48 +151,48 @@ class TkPreview:
 
         self._display(canvas)
 
+    def set_background(self, pil_img):
+        """Set the starfield the preview composites onto (no opaque box)."""
+        self._bg_pil = pil_img
+        self.root.after(0, self._render)
+
     def _display(self, rgb_array):
-        """Show an RGB numpy array on the Tk canvas (thread-safe).
+        """Show an RGB numpy array, feathered onto the starfield (thread-safe)."""
+        self._content = Image.fromarray(rgb_array)
+        self.root.after(0, self._render)
 
-        Always scales the image to fit the viewport while maintaining
-        aspect ratio.  The image is centred in the canvas.
-        """
-        pil_img = Image.fromarray(rgb_array)
+    def _render(self):
+        """Composite the current image (feathered edges) onto the starfield and
+        present it as a single seamless canvas image — no box background."""
+        if self._placeholder is not None:
+            self._placeholder.place_forget()
+            self._placeholder = None
 
-        def _update(img=pil_img):
-            # Hide placeholder text on first real image
-            if self._placeholder is not None:
-                self._placeholder.place_forget()
-                self._placeholder = None
+        self.canvas.update_idletasks()
+        vp_w = max(self.canvas.winfo_width(), PREVIEW_MIN_W)
+        vp_h = max(self.canvas.winfo_height(), PREVIEW_MIN_H)
 
-            # Measure the current viewport size
-            self.canvas.update_idletasks()
-            vp_w = self.canvas.winfo_width()
-            vp_h = self.canvas.winfo_height()
-            vp_w = max(vp_w, PREVIEW_MIN_W)
-            vp_h = max(vp_h, PREVIEW_MIN_H)
+        if self._bg_pil is not None:
+            base = self._bg_pil.resize((vp_w, vp_h), Image.LANCZOS).convert('RGB')
+        else:
+            base = Image.new('RGB', (vp_w, vp_h), SPACE)
 
-            iw, ih = img.size
+        if self._content is not None:
+            iw, ih = self._content.size
+            s = min(vp_w / iw, vp_h / ih)
+            nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
+            content = self._content.resize((nw, nh), Image.LANCZOS).convert('RGB')
+            mask = _feather_mask(nw, nh, max(8, min(nw, nh) // 8))
+            base.paste(content, ((vp_w - nw) // 2, (vp_h - nh) // 2), mask)
 
-            # Always scale to fit viewport (up or down)
-            scale = min(vp_w / iw, vp_h / ih)
-            iw_new, ih_new = int(iw * scale), int(ih * scale)
-            display_img = img.resize((iw_new, ih_new), Image.LANCZOS)
-
-            self._tk_photo = ImageTk.PhotoImage(display_img)
-
-            # Centre the image in the canvas
-            cx, cy = vp_w // 2, vp_h // 2
-
-            if self._canvas_image_id is not None:
-                self.canvas.coords(self._canvas_image_id, cx, cy)
-                self.canvas.itemconfigure(self._canvas_image_id,
-                                          image=self._tk_photo)
-            else:
-                self._canvas_image_id = self.canvas.create_image(
-                    cx, cy, anchor='center', image=self._tk_photo)
-
-        self.root.after(0, _update)
+        self._tk_photo = _to_photo(base)
+        cx, cy = vp_w // 2, vp_h // 2
+        if self._canvas_image_id is not None:
+            self.canvas.coords(self._canvas_image_id, cx, cy)
+            self.canvas.itemconfigure(self._canvas_image_id, image=self._tk_photo)
+        else:
+            self._canvas_image_id = self.canvas.create_image(
+                cx, cy, anchor='center', image=self._tk_photo)
 
     @staticmethod
     def _to_rgb_uint8(img):
@@ -217,8 +237,9 @@ class OeuvreApp:
     def __init__(self, root, auto_target=None):
         self.root = root
         self.root.title('Oeuvre — SHO Processing Pipeline')
-        self.root.configure(bg=BG)
+        self.root.configure(bg=SPACE)
         self.root.minsize(1100, 700)
+        self._set_window_icon()
 
         # Centre on screen
         w, h = 1400, 800
@@ -234,6 +255,17 @@ class OeuvreApp:
 
         if auto_target:
             self._auto_select(auto_target)
+
+    def _set_window_icon(self):
+        """Use the app icon for the window/title bar (and Dock where honored)."""
+        try:
+            p = os.path.join(os.path.dirname(__file__), 'assets', 'icon.png')
+            if os.path.exists(p):
+                self._icon_photo = _to_photo(
+                    Image.open(p).resize((256, 256), Image.LANCZOS))
+                self.root.iconphoto(True, self._icon_photo)
+        except Exception:
+            pass
 
     # ── UI construction ─────────────────────────────────────────────────
 
@@ -251,6 +283,19 @@ class OeuvreApp:
                         font=FONT, padding=(16, 8))
         style.map('Accent.TButton',
                   background=[('active', ACCENT2)])
+        # Dark glass widgets
+        style.configure('TButton', background=BG_LIGHT, foreground=FG,
+                        bordercolor=GLASS_EDGE, focuscolor=GLASS_EDGE)
+        style.map('TButton', background=[('active', BG)],
+                  foreground=[('disabled', DIM)])
+        style.configure('TCheckbutton', background=BG, foreground=FG,
+                        font=FONT_SMALL)
+        style.map('TCheckbutton',
+                  background=[('active', BG)], foreground=[('disabled', DIM)])
+        style.configure('TCombobox', fieldbackground=BG_LIGHT, background=BG,
+                        foreground=FG, arrowcolor=FG, bordercolor=GLASS_EDGE)
+        style.map('TCombobox', fieldbackground=[('readonly', BG_LIGHT)],
+                  foreground=[('readonly', FG)])
 
         # ── Header ──────────────────────────────────────────────────────
         header = ttk.Frame(self.root, padding=16)
@@ -261,7 +306,7 @@ class OeuvreApp:
                   style='Dim.TLabel').pack(side='left', padx=(12, 0))
 
         # ── Tab notebook ────────────────────────────────────────────────
-        style.configure('TNotebook', background=BG)
+        style.configure('TNotebook', background=SPACE, borderwidth=0)
         style.configure('TNotebook.Tab', font=FONT, padding=(16, 6),
                         background=BG_LIGHT, foreground=FG)
         style.map('TNotebook.Tab',
@@ -282,133 +327,170 @@ class OeuvreApp:
         self._build_projection_tab(proj_tab)
 
     def _build_processing_tab(self, parent):
-        """Build all Processing tab contents into *parent*."""
+        """Processing tab: frosted-glass cards floating over a starfield."""
+        cv = tk.Canvas(parent, highlightthickness=0, bd=0, bg=SPACE)
+        cv.pack(fill='both', expand=True)
+        self._proc_cv = cv
+        self._proc_bg_id = None
+        self._proc_bg_size = None
+        self._proc_bg_after = None
+        self._proc_bg_photo = None
 
-        # ── Target selection ────────────────────────────────────────────
-        sel_frame = ttk.Frame(parent, padding=(16, 12, 16, 8))
-        sel_frame.pack(fill='x')
+        def card():
+            f = tk.Frame(cv, bg=BG, highlightbackground=GLASS_EDGE,
+                         highlightcolor=GLASS_EDGE, highlightthickness=1, bd=0)
+            bg = tk.Label(f, bd=0, bg=BG)            # frosted-starfield backdrop
+            bg.place(relx=0, rely=0, relwidth=1, relheight=1)
+            bg.lower()
+            return f, bg
 
-        ttk.Label(sel_frame, text='Target:').pack(side='left')
-
+        # ── Controls card ────────────────────────────────────────────────
+        controls, controls_bg = card()
+        row = tk.Frame(controls, bg=BG)
+        row.pack(fill='x', padx=16, pady=(14, 6))
+        ttk.Label(row, text='Target:').pack(side='left')
         self.target_var = tk.StringVar()
         self.target_combo = ttk.Combobox(
-            sel_frame, textvariable=self.target_var,
-            state='readonly', font=FONT, width=30,
-        )
+            row, textvariable=self.target_var, state='readonly',
+            font=FONT, width=28)
         self.target_combo.pack(side='left', padx=(8, 8))
         self.target_combo.bind('<<ComboboxSelected>>', self._on_target_selected)
+        ttk.Button(row, text='Browse…', command=self._browse_target).pack(
+            side='left', padx=(0, 8))
+        ttk.Button(row, text='↻', width=3, command=self._refresh_targets).pack(
+            side='left')
 
-        ttk.Button(sel_frame, text='Browse…',
-                   command=self._browse_target).pack(side='left', padx=(0, 8))
-
-        ttk.Button(sel_frame, text='↻', width=3,
-                   command=self._refresh_targets).pack(side='left')
-
-        # ── Info line ───────────────────────────────────────────────────
         self.info_var = tk.StringVar(value='Select a target to begin')
-        info_frame = ttk.Frame(parent, padding=(16, 0, 16, 8))
-        info_frame.pack(fill='x')
-        ttk.Label(info_frame, textvariable=self.info_var,
-                  style='Dim.TLabel').pack(side='left')
+        ttk.Label(controls, textvariable=self.info_var,
+                  style='Dim.TLabel').pack(anchor='w', padx=16, pady=(0, 8))
 
-        # ── Options row ─────────────────────────────────────────────────
-        opt_frame = ttk.Frame(parent, padding=(16, 0, 16, 8))
-        opt_frame.pack(fill='x')
-
+        # Option vars are retained (and still wired into PipelineConfig) so they
+        # can be re-exposed later; for now only "Clear cache" is shown.
         self.skip_siril_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text='Skip preprocessing (reuse masters)',
-                        variable=self.skip_siril_var).pack(side='left')
-
         self.recolor_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text='Recolor only (skip to color balance)',
-                        variable=self.recolor_var).pack(side='left', padx=(16, 0))
-
-        self.clear_cache_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text='Clear cache (full reprocess)',
-                        variable=self.clear_cache_var).pack(side='left', padx=(16, 0))
-
         self.flatten_bg_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text='Flatten background (cloud/gradient removal)',
-                        variable=self.flatten_bg_var).pack(side='left', padx=(16, 0))
-
         self.truthful_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text='Truthful (no star suppression, no SCNR)',
-                        variable=self.truthful_var).pack(side='left', padx=(16, 0))
+        self.clear_cache_var = tk.BooleanVar(value=False)
 
-        # ── Color tuning sliders ─────────────────────────────────────────
-        slider_frame = ttk.Frame(parent, padding=(16, 0, 16, 8))
-        slider_frame.pack(fill='x')
+        opt = tk.Frame(controls, bg=BG)
+        opt.pack(fill='x', padx=16, pady=(0, 6))
+        ttk.Checkbutton(opt, text='Clear cache (full reprocess from raw)',
+                        variable=self.clear_cache_var).pack(side='left')
 
+        sld = tk.Frame(controls, bg=BG)
+        sld.pack(fill='x', padx=16, pady=(0, 6))
         self.hue_strength_var = tk.DoubleVar(value=0.44)
-        self.oiii_factor_var  = tk.DoubleVar(value=0.38)
+        self.oiii_factor_var = tk.DoubleVar(value=0.38)
+        self._make_slider(sld, 'Gold', self.hue_strength_var, 0.0, 1.0)
+        self._make_slider(sld, 'Blue', self.oiii_factor_var, 0.0, 1.0,
+                          padx=(24, 0))
 
-        self._make_slider(slider_frame, 'Gold',
-                          self.hue_strength_var, 0.0, 1.0)
-        self._make_slider(slider_frame, 'Blue',
-                          self.oiii_factor_var,  0.0, 1.0, padx=(24, 0))
-
-        # ── Run button ──────────────────────────────────────────────────
-        btn_frame = ttk.Frame(parent, padding=(16, 4, 16, 8))
-        btn_frame.pack(fill='x')
-
-        self.run_btn = ttk.Button(
-            btn_frame, text='▶  Run Pipeline', style='Accent.TButton',
-            command=self._run,
-        )
+        runrow = tk.Frame(controls, bg=BG)
+        runrow.pack(fill='x', padx=16, pady=(0, 14))
+        self.run_btn = ttk.Button(runrow, text='▶  Run Pipeline',
+                                  style='Accent.TButton', command=self._run)
         self.run_btn.pack(side='left')
-
         self.status_var = tk.StringVar(value='')
-        ttk.Label(btn_frame, textvariable=self.status_var,
+        ttk.Label(runrow, textvariable=self.status_var,
                   style='Dim.TLabel').pack(side='left', padx=(16, 0))
 
-        # ── Main content: preview (left) + log (right) ─────────────────
-        content = ttk.Frame(parent, padding=(16, 0, 16, 16))
-        content.pack(fill='both', expand=True)
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=2)
-        content.rowconfigure(0, weight=1)
-
-        # Preview pane (left) — scrollable canvas
-        preview_frame = ttk.Frame(content)
-        preview_frame.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
-        preview_frame.rowconfigure(1, weight=1)
-        preview_frame.columnconfigure(0, weight=1)
-
-        ttk.Label(preview_frame, text='Preview',
-                  style='Dim.TLabel').grid(row=0, column=0, sticky='w')
-
-        self.preview_canvas = tk.Canvas(
-            preview_frame, bg=BG_LIGHT, relief='flat',
-            highlightthickness=0,
-        )
-        self.preview_canvas.grid(row=1, column=0, sticky='nsew', pady=(4, 0))
-
-        # Placeholder text (hidden when first image arrives)
+        # ── Preview card ─────────────────────────────────────────────────
+        preview_card, preview_bg = card()
+        ttk.Label(preview_card, text='Preview', style='Dim.TLabel').pack(
+            anchor='w', padx=12, pady=(8, 0))
+        self.preview_canvas = tk.Canvas(preview_card, bg=BG_LIGHT, relief='flat',
+                                        highlightthickness=0)
+        self.preview_canvas.pack(fill='both', expand=True, padx=12, pady=(4, 12))
         self.preview_placeholder = tk.Label(
             self.preview_canvas, bg=BG_LIGHT,
-            text='Pipeline preview will appear here',
-            fg=DIM, font=FONT_SMALL,
-        )
+            text='Pipeline preview will appear here', fg=DIM, font=FONT_SMALL)
         self.preview_placeholder.place(relx=0.5, rely=0.5, anchor='center')
 
-        # Log pane (right)
-        log_frame = ttk.Frame(content)
-        log_frame.grid(row=0, column=1, sticky='nsew')
-
-        ttk.Label(log_frame, text='Log',
-                  style='Dim.TLabel').pack(anchor='w')
-
+        # ── Log card ─────────────────────────────────────────────────────
+        log_card, log_bg = card()
+        ttk.Label(log_card, text='Log', style='Dim.TLabel').pack(
+            anchor='w', padx=12, pady=(8, 0))
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, font=FONT_LOG,
-            bg=BG_LIGHT, fg=FG, insertbackground=FG,
-            relief='flat', borderwidth=0,
-            wrap='word', state='disabled',
-        )
-        self.log_text.pack(fill='both', expand=True, pady=(4, 0))
+            log_card, font=FONT_LOG, bg=BG_LIGHT, fg=FG, insertbackground=FG,
+            relief='flat', borderwidth=0, wrap='word', state='disabled')
+        self.log_text.pack(fill='both', expand=True, padx=12, pady=(4, 12))
 
-        # Create the TkPreview object
         self.tk_preview = TkPreview(self.root, self.preview_canvas,
                                     self.preview_placeholder)
+
+        # Embed the cards in the starfield canvas; (re)position on resize.
+        self._proc_cards = {
+            'controls': cv.create_window(0, 0, anchor='nw', window=controls),
+            'preview': cv.create_window(0, 0, anchor='nw', window=preview_card),
+            'log': cv.create_window(0, 0, anchor='nw', window=log_card),
+        }
+        self._card_bgs = {'controls': controls_bg, 'preview': preview_bg,
+                          'log': log_bg}
+        self._card_photos = {}        # keep PhotoImage refs alive
+        cv.bind('<Configure>', self._relayout_proc)
+
+    def _proc_boxes(self, w, h):
+        """Pixel boxes (x0, y0, x1, y1) for the three panels at size (w, h)."""
+        pad, gap, ctrl_h = 18, 14, 208
+        inner_w = w - 2 * pad
+        top = pad + ctrl_h + gap
+        bot_h = max(140, h - top - pad)
+        left_w = int(inner_w * 0.60)
+        return {
+            'controls': (pad, pad, pad + inner_w, pad + ctrl_h),
+            'preview': (pad, top, pad + left_w, top + bot_h),
+            'log': (pad + left_w + gap, top, pad + inner_w, top + bot_h),
+        }
+
+    def _set_proc_bg(self, w, h):
+        """Render the starfield and frost each panel with the stars behind it."""
+        if self._proc_bg_size == (w, h):
+            return
+        self._proc_bg_size = (w, h)
+        cv = self._proc_cv
+        try:
+            sf = render_starfield(w, h, seed=7)
+        except Exception:
+            return  # degrade to the solid SPACE background
+
+        self._proc_bg_photo = _to_photo(sf)
+        if self._proc_bg_id is None:
+            self._proc_bg_id = cv.create_image(0, 0, anchor='nw',
+                                               image=self._proc_bg_photo)
+        else:
+            cv.itemconfigure(self._proc_bg_id, image=self._proc_bg_photo)
+        cv.tag_lower(self._proc_bg_id)
+
+        # Each panel background = the EXACT starfield crop behind it, so the
+        # panel is seamless with the canvas — looks like no background, just the
+        # border, with the stars showing straight through.
+        boxes = self._proc_boxes(w, h)
+        for name, lbl in self._card_bgs.items():
+            x0, y0, x1, y1 = boxes[name]
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                continue
+            self._card_photos[name] = _to_photo(sf.crop((x0, y0, x1, y1)))
+            lbl.configure(image=self._card_photos[name])
+
+        # Hand the preview its starfield crop; it feathers the image onto this
+        # (no opaque box background).
+        px0, py0, px1, py1 = boxes['preview']
+        if px1 - px0 > 4 and py1 - py0 > 4:
+            self.tk_preview.set_background(sf.crop((px0, py0, px1, py1)))
+
+    def _relayout_proc(self, event=None):
+        cv = self._proc_cv
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 80 or h < 80:
+            return
+        # Debounce the starfield regen (resize fires many events).
+        if self._proc_bg_after is not None:
+            cv.after_cancel(self._proc_bg_after)
+        self._proc_bg_after = cv.after(140, lambda: self._set_proc_bg(w, h))
+
+        for name, (x0, y0, x1, y1) in self._proc_boxes(w, h).items():
+            cv.coords(self._proc_cards[name], x0, y0)
+            cv.itemconfigure(self._proc_cards[name], width=x1 - x0, height=y1 - y0)
 
     def _build_projection_tab(self, parent):
         """Build Projection tab — sky map visualisation."""
@@ -612,7 +694,7 @@ class OeuvreApp:
         ch = max(self.proj_canvas.winfo_height(), 300)
 
         pil_img = self.skymap.render_map(canvas_w=cw, canvas_h=ch)
-        self._proj_photo = ImageTk.PhotoImage(pil_img)
+        self._proj_photo = _to_photo(pil_img)
 
         self.proj_canvas.configure(scrollregion=(0, 0, cw, ch))
         if self._proj_canvas_id is not None:

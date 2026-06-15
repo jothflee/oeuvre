@@ -1,40 +1,28 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║                   Mosaic Panel Grouper for Siril                           ║
+║                       Mosaic Panel Grouper                                 ║
 ║        Groups light frames by telescope pointing for mosaic prep           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-Reads RA/DEC from FITS headers of all light frames in a Siril workspace,
-clusters them by pointing position, and creates a new directory structure
-with symlinks so that each panel group can be independently preprocessed
-with Siril's Mono_Preprocessing.ssf script.
+Reads RA/DEC from the FITS headers of all light frames, clusters them by
+pointing position, and creates a symlinked directory structure so each panel
+group can be preprocessed independently. All derived state lives under
+_sho_work so it can be cleared in one shot.
 
 Input structure (existing):
-    <target>/siril_workspace/<filter>/
-        lights/     *.fits raw frames (mixed pointings)
-        darks/      dark frames
-        flats/      flat frames (optional)
-        biases/     bias frames (optional)
-        masters/    pre-stacked masters (optional)
+    <target>/Light/<filter>/   *.fits raw frames (mixed pointings)
+    <darks>/                   shared dark frames
 
 Output structure (created):
-    <target>/siril_workspace_mosaic/
-        panel_1/
-            <filter>/
-                lights/     -> symlinks to grouped lights
-                darks/      -> symlinks to original darks
-                flats/      -> symlinks to original flats
-                biases/     -> symlinks to original biases
-                masters/    -> symlinks to original masters
-        panel_2/
-            <filter>/
-                ...
+    <target>/_sho_work/panels/
+        panel_1/<filter>/lights/   -> symlinks to grouped lights
+        panel_1/<filter>/darks/    -> symlinks to shared darks
+        panel_2/<filter>/...
 
 Usage:
-    python mosaic_prep.py <target_dir>
-    python mosaic_prep.py IC_1805
-    python mosaic_prep.py IC_1805 --no-siril   # only create panel dirs
+    python -m oeuvre.mosaic_prep <target_dir>
+    python -m oeuvre.mosaic_prep IC_1805 --no-preprocess   # only panel dirs
 """
 
 import os
@@ -444,18 +432,19 @@ def symlink_dir_contents(src_dir, dst_dir):
         src = os.path.join(src_dir, fname)
         if os.path.isfile(src):
             dst = os.path.join(dst_dir, fname)
-            if not os.path.exists(dst):
-                os.symlink(os.path.abspath(src), dst)
-                count += 1
+            if os.path.lexists(dst):       # replace stale/broken links
+                os.unlink(dst)
+            os.symlink(os.path.abspath(src), dst)
+            count += 1
     return count
 
 
-def build_panel_dirs(target_dir, cluster_radius_deg=0.15, output_suffix='_mosaic',
-                     darks_dir=None):
+def build_panel_dirs(target_dir, cluster_radius_deg=0.15, darks_dir=None):
     """Build the panel directory structure for mosaic preprocessing.
 
     Clusters light frames by pointing position and creates
-    <target>/siril_workspace_mosaic/panel_N/<filter>/lights/
+    <target>/_sho_work/panels/panel_N/<filter>/lights/  (all derived state lives
+    under _sho_work so it can be cleared in one shot)
     with symlinks to the original FITS files.
 
     Supports two input layouts:
@@ -471,7 +460,6 @@ def build_panel_dirs(target_dir, cluster_radius_deg=0.15, output_suffix='_mosaic
     Args:
         target_dir: path to target (e.g. 'IC_1805')
         cluster_radius_deg: cluster radius in degrees (default 0.15°)
-        output_suffix: suffix for the output workspace dir
         darks_dir: path to shared darks directory (optional)
 
     Returns:
@@ -641,8 +629,8 @@ def build_panel_dirs(target_dir, cluster_radius_deg=0.15, output_suffix='_mosaic
         print("ERROR: No panels have data from all filters")
         sys.exit(1)
 
-    # Create output structure
-    out_workspace = os.path.join(target_dir, f'siril_workspace{output_suffix}')
+    # Create output structure under _sho_work (single clearable cache root)
+    out_workspace = os.path.join(target_dir, '_sho_work', 'panels')
     os.makedirs(out_workspace, exist_ok=True)
 
     panel_map = {}
@@ -675,8 +663,9 @@ def build_panel_dirs(target_dir, cluster_radius_deg=0.15, output_suffix='_mosaic
             for fname, _, _ in members:
                 src = source_lookup[(filt, fname)]
                 dst = os.path.join(lights_dst, fname)
-                if not os.path.exists(dst):
-                    os.symlink(src, dst)
+                if os.path.lexists(dst):       # replace stale/broken links
+                    os.unlink(dst)
+                os.symlink(src, dst)
             print(f"  {filt}: {len(members)} lights "
                   f"@ ({cra:.3f}, {cdec:.3f})")
 
@@ -739,8 +728,6 @@ Examples:
                         help='Target directory containing Light/<filter>/')
     parser.add_argument('--radius', type=float, default=0.15,
                         help='Cluster radius in degrees (default: 0.15)')
-    parser.add_argument('--output-suffix', default='_mosaic',
-                        help='Suffix for output workspace dir (default: _mosaic)')
     parser.add_argument('--darks-dir', default=None,
                         help='Path to shared darks directory')
     parser.add_argument('--no-preprocess', action='store_true',
@@ -759,7 +746,6 @@ Examples:
     panel_map, out_workspace, stats = build_panel_dirs(
         target,
         cluster_radius_deg=args.radius,
-        output_suffix=args.output_suffix,
         darks_dir=args.darks_dir,
     )
 

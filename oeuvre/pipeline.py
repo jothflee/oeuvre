@@ -323,6 +323,18 @@ def run_pipeline(cfg: PipelineConfig):
     cfg.log(f"  SHO Pipeline — {target_name}")
     cfg.log("=" * 60)
 
+    # Clear cache (complete): all derived state — panel workspace, stacked
+    # masters, and the SHO work cache — lives under _sho_work, so one wipe is a
+    # full reprocess from the raw subs. Must happen before Step 1.
+    if cfg.clear_cache:
+        output_dir = cfg.output_dir or target
+        for d in {os.path.join(target, '_sho_work'),
+                  os.path.join(output_dir, '_sho_work')}:
+            if os.path.isdir(d):
+                cfg.log(f"  [CLEAR CACHE] Removing {d}")
+                shutil.rmtree(d)
+        cfg.log("  [CLEAR CACHE] Done — full reprocess from raw subs\n")
+
     # ── Step 1: Group frames by pointing ────────────────────────────────
     cfg.log(f"\n▸ Step 1/4: Grouping frames by RA/DEC pointing...\n")
 
@@ -366,15 +378,6 @@ def run_pipeline(cfg: PipelineConfig):
     cfg.log(f"\n▸ Step 4/4: SHO Hubble palette processing...\n")
 
     output_dir = cfg.output_dir or target
-    # Clear the _sho_work cache if requested (full reprocess)
-    if cfg.clear_cache:
-        work_dir = os.path.join(output_dir, '_sho_work')
-        if os.path.isdir(work_dir):
-            cfg.log(f"  [CLEAR CACHE] Removing {work_dir}")
-            shutil.rmtree(work_dir)
-            cfg.log("  [CLEAR CACHE] Done — full reprocess will run")
-        else:
-            cfg.log("  [CLEAR CACHE] No cache found, nothing to remove")
     star_consensus = (cfg.star_consensus or 'auto').strip().lower()
     if star_consensus == 'auto':
         star_consensus = _auto_star_consensus_from_stats(stats)

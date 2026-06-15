@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Pure-Python wheel + sdist (installable on any OS with `pip install`).
+  dist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  # Standalone, double-clickable bundles (no Python needed) per OS.
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, name: Oeuvre-macos }
+          - { os: ubuntu-latest, name: Oeuvre-linux }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 python3-tk
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Build .icns (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -e
+          ICONSET=oeuvre.iconset; mkdir -p "$ICONSET"
+          for s in 16 32 128 256 512; do
+            sips -z $s $s oeuvre/assets/icon.png --out "$ICONSET/icon_${s}x${s}.png"
+            d=$((s*2)); sips -z $d $d oeuvre/assets/icon.png --out "$ICONSET/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns "$ICONSET" -o oeuvre/assets/oeuvre.icns
+
+      - name: Bundle with PyInstaller
+        run: |
+          ICON=oeuvre/assets/icon.png
+          [ "${{ runner.os }}" = "macOS" ] && ICON=oeuvre/assets/oeuvre.icns
+          uv run --with pyinstaller pyinstaller --noconfirm --windowed --name Oeuvre --icon "$ICON" \
+            --collect-all astropy \
+            --collect-all astropy_iers_data \
+            --collect-all erfa \
+            --collect-data cv2 \
+            --collect-data oeuvre \
+            tools/launch.py
+
+      - name: Package
+        run: |
+          cd dist
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            zip -ry "../${{ matrix.name }}.zip" Oeuvre.app
+          else
+            tar czf "../${{ matrix.name }}.tar.gz" Oeuvre
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.zip
+            ${{ matrix.name }}.tar.gz
+          if-no-files-found: ignore
+
+  # Attach everything to the GitHub Release (tag pushes only).
+  release:
+    needs: [dist, bundle]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

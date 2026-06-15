@@ -2494,16 +2494,17 @@ class SHOPipeline:
         tiff_size = os.path.getsize(tiff_path) / (1024 * 1024)
         self.log(f"  TIFF: {tiff_path}  ({tiff_size:.1f} MB)")
 
-        # 8-bit PNG preview
+        # 16-bit PNG \u2014 full precision, no 8-bit truncation (reuses the TIFF
+        # array). Zooming no longer shows flat, posterized pixels.
         png_path = os.path.join(self.output_dir, f"{base_name}.png")
-        png_u8 = np.clip(final * 255, 0, 255).astype(np.uint8)
-        png_bgr = cv2.cvtColor(png_u8, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(png_path, png_bgr)
-        self.log(f"  PNG:  {png_path}")
+        cv2.imwrite(png_path, tiff_bgr)
+        self.log(f"  PNG (16-bit): {png_path}")
 
-        # Phase 4: final product
+        # 8-bit quick-look copy for the on-screen preview / phase debug only.
+        png8_bgr = cv2.cvtColor(
+            np.clip(final * 255, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
         phase4_path = os.path.join(self.phase_dir, 'phase_4_final.png')
-        cv2.imwrite(phase4_path, png_bgr)
+        cv2.imwrite(phase4_path, png8_bgr)
         self.log(f"  [phase_4_final.png] saved")
         self.preview.show_full(final, "Phase 4 \u2014 Final")
 

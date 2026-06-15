@@ -36,7 +36,7 @@ def _bg_sigma(img):
     return med, (mad if mad > 0 else (float(v.std()) or 1e-6))
 
 
-def detect_stars(image, max_stars=80, thresh_sigma=5.0,
+def detect_stars(image, max_stars=200, thresh_sigma=5.0,
                  min_area=2, max_area=120):
     """Detect stars and return flux-weighted sub-pixel centroids.
 
@@ -114,7 +114,7 @@ def _build_invariants(xy, n_neighbors=6, max_elong=10.0):
 
 
 def match_and_solve(src_img, dst_img, log=print, min_inliers=8,
-                    inv_tol=0.05, max_stars=80):
+                    inv_tol=0.05, max_stars=200):
     """Match stars between two images via asterism invariants and solve a
     4-DOF similarity transform (translate + rotate + uniform scale).
 

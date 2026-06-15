@@ -92,9 +92,10 @@ def plate_solve(fits_path, *, timeout=300, scale_low=None, scale_high=None,
         except Exception:
             pass
 
-    # Create temp output directory inside the workspace so the container
-    # can see it at /astro/_solve_tmp/
-    work_dir = os.path.join(workspace(), '_solve_tmp')
+    # Temp dir under the target's _sho_work (still inside the workspace, so the
+    # container sees it under /astro/...) — keeps all derived files in one place.
+    work_dir = os.path.join(os.path.dirname(os.path.abspath(fits_path)),
+                            '_sho_work', '_solve_tmp')
     os.makedirs(work_dir, exist_ok=True)
 
     try:
