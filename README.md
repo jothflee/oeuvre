@@ -2,9 +2,14 @@
 
 [![CI](https://github.com/jothflee/oeuvre/actions/workflows/ci.yml/badge.svg)](https://github.com/jothflee/oeuvre/actions/workflows/ci.yml)
 
-Pure-Python SHO narrowband astrophotography processing pipeline — no external
-Siril dependency. Calibrates, registers, and stacks per-filter light frames,
-then produces a stretched, star-balanced Hubble-palette (SHO) image.
+Point Oeuvre at a night's worth of subs and quickly get a nice SHO image out —
+**fully automated, with only light touch-up** (no heavy manual editing). It
+calibrates, registers, and stacks your per-filter light frames, then produces a
+stretched, star-balanced Hubble-palette (SHO) image. Pure Python, no Siril
+dependency.
+
+**Goal:** hands-off **full-sky SHO mosaics** — process every target captured in
+a session and assemble them into a wide-field mosaic automatically.
 
 Registration everywhere (sub stacking, channel alignment, mosaic panels) uses a
 single star-centroid + asterism matcher. Star removal shells out to a local
