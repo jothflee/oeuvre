@@ -71,18 +71,23 @@ jobs:
 
       - name: Package
         run: |
-          cd dist
           if [ "${{ runner.os }}" = "macOS" ]; then
-            zip -ry "../${{ matrix.name }}.zip" Oeuvre.app
+            # Single-file, double-clickable .dmg with a drag-to-Applications layout.
+            staging="$(mktemp -d)/Oeuvre"
+            mkdir -p "$staging"
+            cp -R dist/Oeuvre.app "$staging/Oeuvre.app"
+            ln -s /Applications "$staging/Applications"
+            hdiutil create -volname Oeuvre -srcfolder "$staging" \
+              -ov -format UDZO "${{ matrix.name }}.dmg"
           else
-            tar czf "../${{ matrix.name }}.tar.gz" Oeuvre
+            tar czf "${{ matrix.name }}.tar.gz" -C dist Oeuvre
           fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: |
-            ${{ matrix.name }}.zip
+            ${{ matrix.name }}.dmg
             ${{ matrix.name }}.tar.gz
           if-no-files-found: ignore
 
