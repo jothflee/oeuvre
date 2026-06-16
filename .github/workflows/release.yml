@@ -60,14 +60,30 @@ jobs:
           # tools/pyinstaller-hooks overrides the contrib astropy hook, which
           # otherwise force-imports astropy.visualization.wcsaxes (-> matplotlib
           # importorskip -> build abort). We only need astropy.io.fits.
+          # _tkinter is statically linked into the uv python-build-standalone
+          # interpreter (a builtin, not a .so), so PyInstaller's tkinter hook
+          # never auto-triggers. Forcing it as a hidden import runs the hook
+          # (bundling the Tcl/Tk data + runtime env setup); --collect-all tkinter
+          # bundles the Python package. Without these the GUI crashes on launch
+          # with "No module named 'tkinter'".
           uv run --with pyinstaller pyinstaller --noconfirm --windowed --name Oeuvre --icon "$ICON" \
             --additional-hooks-dir tools/pyinstaller-hooks \
+            --hidden-import _tkinter \
+            --collect-all tkinter \
             --collect-data cv2 \
             --collect-data oeuvre \
             --exclude-module matplotlib \
             --exclude-module pytest \
             --exclude-module IPython \
             tools/launch.py
+
+      - name: Verify bundle (tkinter + Tcl/Tk present)
+        run: |
+          find dist -type d -name tkinter | grep -q . \
+            || { echo "ERROR: tkinter package missing from bundle"; exit 1; }
+          find dist -name init.tcl | grep -q . \
+            || { echo "ERROR: Tcl runtime (init.tcl) missing from bundle"; exit 1; }
+          echo "OK: bundle contains the tkinter package and Tcl/Tk runtime."
 
       - name: Package
         run: |
