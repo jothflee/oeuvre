@@ -57,12 +57,16 @@ jobs:
         run: |
           ICON=oeuvre/assets/icon.png
           [ "${{ runner.os }}" = "macOS" ] && ICON=oeuvre/assets/oeuvre.icns
+          # tools/pyinstaller-hooks overrides the contrib astropy hook, which
+          # otherwise force-imports astropy.visualization.wcsaxes (-> matplotlib
+          # importorskip -> build abort). We only need astropy.io.fits.
           uv run --with pyinstaller pyinstaller --noconfirm --windowed --name Oeuvre --icon "$ICON" \
-            --collect-all astropy \
-            --collect-all astropy_iers_data \
-            --collect-all erfa \
+            --additional-hooks-dir tools/pyinstaller-hooks \
             --collect-data cv2 \
             --collect-data oeuvre \
+            --exclude-module matplotlib \
+            --exclude-module pytest \
+            --exclude-module IPython \
             tools/launch.py
 
       - name: Package
