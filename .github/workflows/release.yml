@@ -8,6 +8,15 @@ on:
 permissions:
   contents: write
 
+env:
+  # Always build against uv's managed python-build-standalone, never the
+  # runner's Homebrew/system Python. That interpreter statically bundles its
+  # own Tcl/Tk, so the resulting app is fully self-contained — it carries no
+  # dependency on system frameworks or /opt/homebrew libs that won't exist on
+  # users' machines. (macos-latest ships Homebrew Python, which uv would
+  # otherwise pick and produce a non-portable bundle.)
+  UV_PYTHON_PREFERENCE: only-managed
+
 jobs:
   # Pure-Python wheel + sdist (installable on any OS with `pip install`).
   dist:
@@ -39,8 +48,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Install managed Python
+        run: uv python install 3.12
+
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --python 3.12
 
       - name: Build .icns (macOS)
         if: runner.os == 'macOS'
@@ -66,7 +78,7 @@ jobs:
           # (bundling the Tcl/Tk data + runtime env setup); --collect-all tkinter
           # bundles the Python package. Without these the GUI crashes on launch
           # with "No module named 'tkinter'".
-          uv run --with pyinstaller pyinstaller --noconfirm --windowed --name Oeuvre --icon "$ICON" \
+          uv run --python 3.12 --with pyinstaller pyinstaller --noconfirm --windowed --name Oeuvre --icon "$ICON" \
             --additional-hooks-dir tools/pyinstaller-hooks \
             --hidden-import _tkinter \
             --collect-all tkinter \
