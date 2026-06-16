@@ -18,6 +18,7 @@ Oeuvre.app/
 *.iconset/
 build/
 dist/
+*.spec
 
 # Oeuvre runtime artifacts / data (these live in the workspace, not the repo)
 _sho_work/
