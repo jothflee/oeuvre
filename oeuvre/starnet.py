@@ -2,22 +2,120 @@
 """
 StarNet star removal — pure-local replacement for Siril's `starnet` command.
 
-Shells out to the bundled StarNet++ v2 CLI (StarNetv2CLI_MacOS/starnet++),
-which operates on 16-bit TIFF only and loads its weights (`starnet2_weights.pb`)
-plus the tensorflow dylibs from its own directory — so the binary MUST be run
-with cwd set to that directory.
+The app can manage a local StarNet v2 install under ``~/oeuvre`` but never
+rehosts the binary. The StarNet CLI operates on 16-bit TIFF only and loads its
+weights (``starnet2_weights.pb``) plus the tensorflow dylibs from its own
+directory — so the binary MUST be run with cwd set to that directory.
 
 Public API mirrors the old `siril_star_removal`:
     remove_stars(rgb_fits_path, work_dir, log) -> (starless, stars)  # [H,W,3] float32
 """
 
 import os
+import shutil
 import subprocess
 
 import numpy as np
 import cv2
 
-from .config import workspace
+from .config import workspace, app_home
+
+STARNET_DIR_NAME = 'StarNetv2CLI_MacOS'
+STARNET_BINARY_NAME = 'starnet++'
+STARNET_OFFICIAL_URL = 'https://starnetastro.com/cli-tools/starnet/'
+
+
+def managed_starnet_dir():
+    """Default local install directory under ~/oeuvre."""
+    return os.path.join(app_home(), STARNET_DIR_NAME)
+
+
+def starnet_binary_path(starnet_dir):
+    """Return the StarNet binary path for a given directory."""
+    return os.path.join(starnet_dir, STARNET_BINARY_NAME)
+
+
+def _is_valid_starnet_dir(path):
+    """Check whether *path* looks like an extracted StarNet v2 folder."""
+    if not path or not os.path.isdir(path):
+        return False
+    binp = starnet_binary_path(path)
+    return os.path.isfile(binp) and os.access(binp, os.X_OK)
+
+
+def resolve_starnet_source(path):
+    """Resolve a user-selected path to the StarNet folder to install/copy."""
+    if not path:
+        return None
+    path = os.path.abspath(os.path.expanduser(path))
+    if os.path.isfile(path):
+        parent = os.path.dirname(path)
+        if os.path.basename(path) == STARNET_BINARY_NAME:
+            return parent if _is_valid_starnet_dir(parent) else None
+        return None
+    if _is_valid_starnet_dir(path):
+        return path
+    nested = os.path.join(path, STARNET_DIR_NAME)
+    if _is_valid_starnet_dir(nested):
+        return nested
+    return None
+
+
+def installed_starnet_dir():
+    """Return the local managed StarNet directory if present."""
+    path = managed_starnet_dir()
+    return path if _is_valid_starnet_dir(path) else None
+
+
+def starnet_status():
+    """Summarize the current StarNet discovery state."""
+    binp, sn_dir = find_starnet()
+    managed_dir = installed_starnet_dir()
+    return {
+        'available': bool(binp),
+        'binary': binp,
+        'dir': sn_dir,
+        'managed_dir': managed_dir,
+        'managed_root': managed_starnet_dir(),
+    }
+
+
+def install_starnet(source_path):
+    """Copy an extracted StarNet folder into the managed ~/oeuvre home."""
+    src = resolve_starnet_source(source_path)
+    if src is None:
+        raise ValueError(
+            'Selected folder does not look like an extracted StarNet v2 '
+            'install.')
+
+    dest = managed_starnet_dir()
+    os.makedirs(app_home(), exist_ok=True)
+    if os.path.abspath(src) == os.path.abspath(dest):
+        return dest
+
+    if os.path.exists(dest):
+        if os.path.islink(dest) or os.path.isfile(dest):
+            os.unlink(dest)
+        else:
+            shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+
+    binp = starnet_binary_path(dest)
+    if os.path.isfile(binp):
+        os.chmod(binp, 0o755)
+    return dest
+
+
+def uninstall_managed_starnet():
+    """Remove the managed local StarNet install, if one exists."""
+    dest = managed_starnet_dir()
+    if os.path.islink(dest) or os.path.isfile(dest):
+        os.unlink(dest)
+        return True
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+        return True
+    return False
 
 
 def find_starnet():
@@ -25,18 +123,20 @@ def find_starnet():
 
     Returns (binary_path, starnet_dir) or (None, None) if not found.
     Honors the STARNET_DIR environment variable as an override, then looks for
-    ``StarNetv2CLI_MacOS/`` under the workspace and the current directory.
+    a managed local install under ``~/oeuvre``, then the workspace and current
+    directory.
     """
     candidates = []
     env_dir = os.environ.get('STARNET_DIR')
     if env_dir:
         candidates.append(env_dir)
     candidates += [
+        managed_starnet_dir(),
         os.path.join(workspace(), 'StarNetv2CLI_MacOS'),
         os.path.join(os.getcwd(), 'StarNetv2CLI_MacOS'),
     ]
     for d in candidates:
-        binp = os.path.join(d, 'starnet++')
+        binp = starnet_binary_path(d)
         if os.path.isfile(binp) and os.access(binp, os.X_OK):
             return binp, d
     return None, None
@@ -88,9 +188,9 @@ def remove_stars(rgb_fits_path, work_dir, log=print, timeout=1800):
     binp, sn_dir = find_starnet()
     if binp is None:
         raise RuntimeError(
-            "StarNet++ binary not found. Expected "
-            f"{os.path.join(workspace(), 'StarNetv2CLI_MacOS', 'starnet++')} "
-            "or set STARNET_DIR."
+            "StarNet++ binary not found. Use Oeuvre's StarNet setup or set "
+            f"STARNET_DIR. Expected {starnet_binary_path(managed_starnet_dir())} "
+            "or the workspace copy."
         )
 
     original = _to_hwc(load_fits(rgb_fits_path)[0])

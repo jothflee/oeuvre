@@ -235,7 +235,7 @@ class SkyMap:
 
         If the file lacks rotation info (CROTA2 / CD matrix) and
         *auto_solve* is True, attempt to plate-solve it via the
-        local astrometry.net Docker solver.
+        configured astrometry.net API endpoint.
         """
         sf = SkyFrame(path)
 
@@ -243,7 +243,12 @@ class SkyMap:
         if auto_solve and not sf._has_wcs:
             _log = log_fn or print
             _log(f"  No WCS in header — attempting plate solve...")
-            wcs = plate_solve(sf.path, log_fn=_log)
+            from .plate_solve import fits_has_wcs, plate_solve_if_needed
+            if fits_has_wcs(sf.path):
+                _log(f"  WCS already present — skipping plate solve")
+                wcs = None
+            else:
+                wcs = plate_solve_if_needed(sf.path, log_fn=_log)
             if wcs:
                 update_fits_wcs(sf.path, wcs, log_fn=_log)
                 # Re-read header with fresh WCS

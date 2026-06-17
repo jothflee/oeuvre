@@ -10,17 +10,31 @@ import os
 import io
 import base64
 import threading
+import webbrowser
 import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext
+from tkinter import ttk, filedialog, scrolledtext, messagebox
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .pipeline import run_pipeline, scan_targets, PipelineConfig
-from .config import workspace
+from .config import (
+    workspace,
+    app_home,
+    ensure_app_home,
+    plate_solve_settings,
+    save_plate_solve_settings,
+)
 from .projection import SkyMap
 from .starfield import render_starfield
 from .projection import _feather_mask
+from .starnet import (
+    STARNET_OFFICIAL_URL,
+    managed_starnet_dir,
+    starnet_status,
+    install_starnet,
+    uninstall_managed_starnet,
+)
 
 
 # ── Colour palette (deep-space / frosted glass) ──────────────────────────────
@@ -252,6 +266,7 @@ class OeuvreApp:
 
         self._build_ui()
         self._refresh_targets()
+        self._refresh_starnet_ui()
 
         if auto_target:
             self._auto_select(auto_target)
@@ -267,6 +282,63 @@ class OeuvreApp:
         except Exception:
             pass
 
+    def _refresh_starnet_ui(self):
+        status = starnet_status()
+        managed_dir = status['managed_dir'] or status['managed_root']
+        if status['available']:
+            if status['dir'] == managed_dir:
+                text = f'Installed locally at {managed_dir}'
+            else:
+                text = f'Found at {status["dir"]}'
+        else:
+            text = (
+                f'Not installed. Open the official site, accept the StarNet '
+                f'license, and install into {managed_dir}')
+        self.starnet_status_var.set(text)
+        if hasattr(self, 'starnet_remove_btn'):
+            self.starnet_remove_btn.configure(
+                state='normal' if status['managed_dir'] else 'disabled')
+
+    def _open_starnet_download(self):
+        webbrowser.open(STARNET_OFFICIAL_URL, new=2, autoraise=True)
+        self._log(
+            f'Opened the official StarNet v2 site: {STARNET_OFFICIAL_URL}')
+
+    def _install_starnet(self):
+        ensure_app_home()
+        path = filedialog.askdirectory(
+            initialdir=app_home(),
+            title='Select extracted StarNetv2CLI_MacOS folder',
+        )
+        if not path:
+            return
+        try:
+            dest = install_starnet(path)
+            self._log(f'✓ Installed StarNet to {dest}')
+            self._refresh_starnet_ui()
+        except Exception as e:
+            self._log(f'✗ StarNet install failed: {e}')
+
+    def _remove_starnet(self):
+        dest = managed_starnet_dir()
+        if not os.path.isdir(dest):
+            self._log('No local StarNet install found to remove')
+            self._refresh_starnet_ui()
+            return
+        if not messagebox.askyesno(
+            'Remove local StarNet copy',
+            f'Remove the local StarNet folder from\n{dest}\n\n'
+            'This only deletes the oeuvre-managed copy, not the official '
+            'download you obtained from StarNet.',
+        ):
+            return
+        try:
+            uninstall_managed_starnet()
+            self._log(f'✓ Removed local StarNet copy from {dest}')
+            self._refresh_starnet_ui()
+        except Exception as e:
+            self._log(f'✗ StarNet removal failed: {e}')
+
     # ── UI construction ─────────────────────────────────────────────────
 
     def _build_ui(self):
@@ -277,6 +349,7 @@ class OeuvreApp:
         style.configure('TButton', font=FONT, padding=(12, 6))
         style.configure('Title.TLabel', font=FONT_TITLE, foreground=ACCENT)
         style.configure('Dim.TLabel', font=FONT_SMALL, foreground=DIM)
+        style.configure('Warn.TLabel', font=FONT_SMALL, foreground=ERR)
         style.configure('Preview.TLabel', background=BG_LIGHT)
         style.configure('Accent.TButton',
                         background=ACCENT, foreground=BG,
@@ -321,6 +394,11 @@ class OeuvreApp:
         self.notebook.add(proc_tab, text='  Processing  ')
         self._build_processing_tab(proc_tab)
 
+        # ── Settings tab ────────────────────────────────────────────────
+        settings_tab = ttk.Frame(self.notebook, padding=0)
+        self.notebook.add(settings_tab, text='  Settings  ')
+        self._build_settings_tab(settings_tab)
+
         # ── Projection tab (placeholder) ────────────────────────────────
         proj_tab = ttk.Frame(self.notebook, padding=0)
         self.notebook.add(proj_tab, text='  Projection  ')
@@ -363,6 +441,12 @@ class OeuvreApp:
         self.info_var = tk.StringVar(value='Select a target to begin')
         ttk.Label(controls, textvariable=self.info_var,
                   style='Dim.TLabel').pack(anchor='w', padx=16, pady=(0, 8))
+
+        self.starnet_warning_var = tk.StringVar(value='')
+        self.starnet_warning_label = ttk.Label(
+            controls, textvariable=self.starnet_warning_var,
+            style='Warn.TLabel')
+        self.starnet_warning_label.pack(anchor='w', padx=16, pady=(0, 10))
 
         # Option vars are retained (and still wired into PipelineConfig) so they
         # can be re-exposed later; for now only "Clear cache" is shown.
@@ -428,6 +512,135 @@ class OeuvreApp:
                           'log': log_bg}
         self._card_photos = {}        # keep PhotoImage refs alive
         cv.bind('<Configure>', self._relayout_proc)
+
+    def _build_settings_tab(self, parent):
+        """Settings tab for StarNet setup and astrometry.net API config."""
+        content = ttk.Frame(parent, padding=18)
+        content.pack(fill='both', expand=True)
+
+        def card(title):
+            f = tk.Frame(content, bg=BG, highlightbackground=GLASS_EDGE,
+                         highlightcolor=GLASS_EDGE, highlightthickness=1, bd=0)
+            ttk.Label(f, text=title, style='Title.TLabel').pack(
+                anchor='w', padx=16, pady=(12, 6))
+            return f
+
+        # StarNet setup card
+        sn_card = card('StarNet v2')
+        sn_card.pack(fill='x', pady=(0, 14))
+        self.starnet_status_var = tk.StringVar(value='')
+        ttk.Label(sn_card, textvariable=self.starnet_status_var,
+                  style='Dim.TLabel').pack(anchor='w', padx=16, pady=(0, 10))
+        sn_row = tk.Frame(sn_card, bg=BG)
+        sn_row.pack(fill='x', padx=16)
+        ttk.Button(sn_row, text='Open official download',
+                   command=self._open_starnet_download).pack(side='left')
+        ttk.Button(sn_row, text='Install / choose folder…',
+                   command=self._install_starnet).pack(side='left', padx=(8, 0))
+        self.starnet_remove_btn = ttk.Button(
+            sn_row, text='Remove local copy', command=self._remove_starnet)
+        self.starnet_remove_btn.pack(side='left', padx=(8, 0))
+
+        ttk.Label(sn_card,
+                  text='Oeuvre only guides you to the official download and keeps '
+                       'a local copy under ~/oeuvre for easy removal.',
+                  style='Dim.TLabel', wraplength=1120, justify='left').pack(
+                      anchor='w', padx=16, pady=(12, 0))
+
+        # Plate solving card
+        ps_card = card('Plate Solving')
+        ps_card.pack(fill='x')
+        ps_info = (
+            'Astrometry.net API base URL and API key. '
+            'Default is the public Nova astrometry.net API.')
+        ttk.Label(ps_card, text=ps_info, style='Dim.TLabel', wraplength=1120,
+                  justify='left').pack(anchor='w', padx=16, pady=(0, 12))
+
+        settings = plate_solve_settings()
+        self.plate_endpoint_var = tk.StringVar(value=settings['endpoint'])
+        self.plate_api_key_var = tk.StringVar(value=settings['api_key'])
+
+        form = tk.Frame(ps_card, bg=BG)
+        form.pack(fill='x', padx=16)
+
+        ttk.Label(form, text='API endpoint').grid(row=0, column=0, sticky='w')
+        endpoint_entry = ttk.Entry(form, textvariable=self.plate_endpoint_var, width=64)
+        endpoint_entry.grid(row=1, column=0, columnspan=3, sticky='ew', pady=(4, 10))
+
+        ttk.Label(form, text='API key').grid(row=2, column=0, sticky='w')
+        api_key_entry = ttk.Entry(form, textvariable=self.plate_api_key_var, width=64,
+                                  show='*')
+        api_key_entry.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(4, 10))
+
+        form.columnconfigure(0, weight=1)
+
+        btn_row = tk.Frame(ps_card, bg=BG)
+        btn_row.pack(fill='x', padx=16, pady=(0, 10))
+        ttk.Button(btn_row, text='Use public nova.astrometry.net',
+                   command=self._reset_plate_solve_endpoint).pack(side='left')
+        ttk.Button(btn_row, text='Save settings',
+                   command=self._save_plate_solve_settings).pack(
+                       side='left', padx=(8, 0))
+
+        self.plate_status_var = tk.StringVar(value='')
+        ttk.Label(ps_card, textvariable=self.plate_status_var,
+                  style='Dim.TLabel').pack(anchor='w', padx=16, pady=(0, 12))
+
+        ttk.Label(ps_card,
+                  text='Use the public Astrometry.net API or point to a '
+                       'compatible self-hosted endpoint. The solver reads '
+                       'these values when plate solving runs.',
+                  style='Dim.TLabel', wraplength=1120, justify='left').pack(
+                      anchor='w', padx=16, pady=(0, 10))
+
+        self._refresh_plate_solve_ui()
+
+    def _refresh_starnet_ui(self):
+        status = starnet_status()
+        managed_dir = status['managed_dir'] or status['managed_root']
+        if status['available']:
+            if status['dir'] == managed_dir:
+                text = f'Installed locally at {managed_dir}'
+            else:
+                text = f'Found at {status["dir"]}'
+            warning = ''
+        else:
+            text = (
+                f'Not installed. Open the official site, accept the StarNet '
+                f'license, and install into {managed_dir}')
+            warning = 'Warning: StarNet is not installed. See Settings.'
+        self.starnet_status_var.set(text)
+        if hasattr(self, 'starnet_remove_btn'):
+            self.starnet_remove_btn.configure(
+                state='normal' if status['managed_dir'] else 'disabled')
+        if hasattr(self, 'starnet_warning_var'):
+            self.starnet_warning_var.set(warning)
+
+    def _refresh_plate_solve_ui(self):
+        settings = plate_solve_settings()
+        endpoint = settings['endpoint'].strip() or 'https://nova.astrometry.net/api/'
+        api_key = settings['api_key'].strip()
+        if hasattr(self, 'plate_endpoint_var'):
+            self.plate_endpoint_var.set(endpoint)
+        if hasattr(self, 'plate_api_key_var'):
+            self.plate_api_key_var.set(api_key)
+        if hasattr(self, 'plate_status_var'):
+            if api_key:
+                self.plate_status_var.set(f'Configured endpoint: {endpoint}')
+            else:
+                self.plate_status_var.set(
+                    f'Endpoint: {endpoint}  |  API key missing')
+
+    def _reset_plate_solve_endpoint(self):
+        self.plate_endpoint_var.set('https://nova.astrometry.net/api/')
+        self._refresh_plate_solve_ui()
+
+    def _save_plate_solve_settings(self):
+        endpoint = self.plate_endpoint_var.get().strip()
+        api_key = self.plate_api_key_var.get().strip()
+        save_plate_solve_settings(endpoint=endpoint, api_key=api_key)
+        self._refresh_plate_solve_ui()
+        self._log('✓ Saved plate-solving settings')
 
     def _proc_boxes(self, w, h):
         """Pixel boxes (x0, y0, x1, y1) for the three panels at size (w, h)."""

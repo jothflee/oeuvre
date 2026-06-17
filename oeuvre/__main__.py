@@ -36,8 +36,10 @@ Launch modes:
 
     # Data location
     parser.add_argument('--workspace', default=None,
-                        help='Data root (targets, darks/, StarNetv2CLI_MacOS/). '
-                             'Overrides OEUVRE_WORKSPACE; default ~/oeuvre-astro')
+                        help='Data root (targets, darks/). Overrides '
+                            'OEUVRE_WORKSPACE; default ~/oeuvre-astro. '
+                            'Optional helpers are managed separately under '
+                            '~/oeuvre.')
 
     # Mosaic prep
     parser.add_argument('--cluster-radius', type=float, default=0.15,

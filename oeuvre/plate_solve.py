@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """
-Plate-solve FITS files using a local astrometry.net Docker service.
+Plate-solve FITS files using an astrometry.net API endpoint.
 
-Runs ``solve-field`` inside the running ``astrometry`` container
-via ``docker compose exec``, then reads the WCS solution back.
+The endpoint is configurable in Oeuvre settings. By default it targets the
+public Nova.astrometry.net API, but self-hosted compatible endpoints work too.
 """
 
+import json
 import math
+import mimetypes
 import os
-import subprocess
 import shutil
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
+from .config import plate_solve_settings
 from .mosaic_prep import read_fits_header
-from .config import workspace
 
-# WCS keywords that solve-field writes into the .wcs file
+# WCS keywords that astrometry.net writes into the .wcs file
 _WCS_KEYS = (
     'CRVAL1', 'CRVAL2', 'CRPIX1', 'CRPIX2',
     'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2',
@@ -24,36 +30,185 @@ _WCS_KEYS = (
     'A_ORDER', 'B_ORDER', 'AP_ORDER', 'BP_ORDER',
 )
 
-
-def _host_to_container(host_path):
-    """Translate a host path under the workspace to /astro/<relative>."""
-    host_path = os.path.abspath(host_path)
-    ws = workspace()
-    rel = os.path.relpath(host_path, ws)
-    if rel.startswith('..'):
-        raise ValueError(f"Path {host_path} is outside workspace {ws}")
-    return '/astro/' + rel
+_DEFAULT_API_BASE = 'https://nova.astrometry.net/api/'
 
 
-def plate_solve(fits_path, *, timeout=300, scale_low=None, scale_high=None,
-                ra_hint=None, dec_hint=None, radius=5.0,
-                downsample=2, log_fn=None):
-    """Plate-solve a FITS file using the running astrometry.net container.
+def _normalize_api_base(endpoint):
+    endpoint = (endpoint or _DEFAULT_API_BASE).strip()
+    if not endpoint:
+        endpoint = _DEFAULT_API_BASE
+    if not endpoint.endswith('/'):
+        endpoint += '/'
+    if '/api/' not in endpoint:
+        endpoint = endpoint.rstrip('/') + '/api/'
+    return endpoint
 
-    Runs ``solve-field`` via ``docker compose exec`` inside the container
-    that already has index files at ``/index`` and the workspace at ``/astro``.
 
-    Args:
-        fits_path:      Path to the FITS file (host or relative).
-        timeout:        Max seconds for the solve attempt.
-        scale_low:      Lower bound for image scale (arcsec/pixel).
-        scale_high:     Upper bound for image scale (arcsec/pixel).
-        ra_hint:        Approx RA in degrees.
-        dec_hint:       Approx DEC in degrees.
-        radius:         Search radius around hint (degrees).
-        downsample:     Downsample factor for source detection (2 is good
-                        for large images).
-        log_fn:         Callable for log messages; defaults to print.
+def _api_root(api_base):
+    return api_base.replace('/api/', '/', 1)
+
+
+def _request_json(url, payload=None, headers=None, method=None, timeout=60):
+    req_headers = {'Accept': 'application/json'}
+    if headers:
+        req_headers.update(headers)
+    if payload is None:
+        req = Request(url, headers=req_headers, method='GET')
+    else:
+        body = urlencode(payload).encode('utf-8')
+        req_headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+        req = Request(url, data=body, headers=req_headers, method=method or 'POST')
+    with urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode('utf-8')
+    return json.loads(raw)
+
+
+def _encode_multipart(fields, files):
+    boundary = '----oeuvre-' + hex(int(time.time() * 1000000))[2:]
+    chunks = []
+
+    for name, value in fields.items():
+        chunks.append(f'--{boundary}\r\n'.encode('utf-8'))
+        chunks.append(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode('utf-8'))
+        chunks.append(str(value).encode('utf-8'))
+        chunks.append(b'\r\n')
+
+    for name, (filename, content) in files.items():
+        content_type = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+        chunks.append(f'--{boundary}\r\n'.encode('utf-8'))
+        chunks.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{os.path.basename(filename)}"\r\n'.encode('utf-8'))
+        chunks.append(f'Content-Type: {content_type}\r\n\r\n'.encode('utf-8'))
+        chunks.append(content)
+        chunks.append(b'\r\n')
+
+    chunks.append(f'--{boundary}--\r\n'.encode('utf-8'))
+    return boundary, b''.join(chunks)
+
+
+def _upload_file(api_base, session, fits_path, payload, timeout=300):
+    url = api_base + 'upload'
+    with open(fits_path, 'rb') as f:
+        data = f.read()
+    fields = {
+        'request-json': json.dumps(dict(payload, session=session)),
+    }
+    boundary, body = _encode_multipart(fields, {'file': (fits_path, data)})
+    req = Request(
+        url,
+        data=body,
+        headers={
+            'Content-Type': f'multipart/form-data; boundary={boundary}',
+            'Referer': api_base + 'login',
+            'Accept': 'application/json',
+        },
+        method='POST',
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def _download_binary(url, path, timeout=120):
+    req = Request(url, headers={'Referer': url.rsplit('/', 1)[0] + '/login'})
+    with urlopen(req, timeout=timeout) as resp, open(path, 'wb') as out:
+        shutil.copyfileobj(resp, out)
+
+
+def _solve_scale_hints(fits_path):
+    try:
+        hdr = read_fits_header(fits_path)
+    except Exception:
+        return {}, None, None
+
+    payload = {}
+    ra_hint = None
+    dec_hint = None
+    if 'RA' in hdr or 'CRVAL1' in hdr:
+        try:
+            ra_hint = float(hdr.get('RA', hdr.get('CRVAL1')))
+        except Exception:
+            ra_hint = None
+    if 'DEC' in hdr or 'CRVAL2' in hdr:
+        try:
+            dec_hint = float(hdr.get('DEC', hdr.get('CRVAL2')))
+        except Exception:
+            dec_hint = None
+
+    scale_low = scale_high = None
+    if 'SCALE' in hdr:
+        try:
+            sc = float(hdr['SCALE'])
+            scale_low, scale_high = sc * 0.8, sc * 1.2
+        except Exception:
+            pass
+    elif 'SECPIX1' in hdr:
+        try:
+            sc = float(hdr['SECPIX1'])
+            scale_low, scale_high = sc * 0.8, sc * 1.2
+        except Exception:
+            pass
+    elif 'CDELT1' in hdr:
+        try:
+            sc = abs(float(hdr['CDELT1'])) * 3600.0
+            scale_low, scale_high = sc * 0.8, sc * 1.2
+        except Exception:
+            pass
+
+    if scale_low is not None and scale_high is not None:
+        payload.update(
+            scale_units='arcsecperpix',
+            scale_type='ul',
+            scale_lower=scale_low,
+            scale_upper=scale_high,
+        )
+    if ra_hint is not None and dec_hint is not None:
+        payload.update(
+            center_ra=ra_hint,
+            center_dec=dec_hint,
+            radius=5.0,
+        )
+    payload.update(
+        downsample_factor=2,
+        publicly_visible='n',
+        allow_commercial_use='d',
+        allow_modifications='d',
+    )
+    return payload, ra_hint, dec_hint
+
+
+def fits_has_wcs(fits_path):
+    """Return True when the FITS header already contains usable WCS data."""
+    try:
+        hdr = read_fits_header(fits_path)
+    except Exception:
+        return False
+
+    return any(
+        key in hdr
+        for key in (
+            'CRVAL1', 'CRVAL2', 'CRPIX1', 'CRPIX2',
+            'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2',
+            'CDELT1', 'CDELT2', 'CROTA2',
+        )
+    )
+
+
+def plate_solve_if_needed(fits_path, **kwargs):
+    """Solve only when the FITS does not already carry WCS metadata."""
+    if fits_has_wcs(fits_path):
+        log_fn = kwargs.get('log_fn') or print
+        log_fn(f"  WCS already present in {os.path.basename(fits_path)}; skipping plate solve")
+        return None
+    return plate_solve(fits_path, **kwargs)
+
+
+def plate_solve(fits_path, *, timeout=300, api_endpoint=None, api_key=None,
+                log_fn=None):
+    """Plate-solve a FITS file using an astrometry.net API endpoint.
+
+    The solver uploads the FITS, polls the resulting submission/job, and then
+    downloads the job's WCS FITS file.
 
     Returns:
         dict of WCS keywords on success, or None on failure.
@@ -66,110 +221,82 @@ def plate_solve(fits_path, *, timeout=300, scale_low=None, scale_high=None,
         log_fn(f"  plate_solve: file not found: {fits_path}")
         return None
 
+    settings = plate_solve_settings()
+    api_base = _normalize_api_base(api_endpoint or settings['endpoint'])
+    api_key = (api_key if api_key is not None else settings['api_key']).strip()
+
+    if not api_key:
+        log_fn('  Plate-solving skipped: no Astrometry.net API key configured')
+        return None
+
     base = os.path.basename(fits_path)
     stem = os.path.splitext(base)[0]
-
-    # Try to read hints from header if not provided
-    if ra_hint is None or dec_hint is None:
-        try:
-            hdr = read_fits_header(fits_path)
-            if ra_hint is None:
-                ra_hint = float(hdr.get('RA', hdr.get('CRVAL1', 0)))
-            if dec_hint is None:
-                dec_hint = float(hdr.get('DEC', hdr.get('CRVAL2', 0)))
-            if scale_low is None and 'SCALE' in hdr:
-                sc = float(hdr['SCALE'])
-                scale_low = sc * 0.8
-                scale_high = sc * 1.2
-            elif scale_low is None and 'SECPIX1' in hdr:
-                sc = float(hdr['SECPIX1'])
-                scale_low = sc * 0.8
-                scale_high = sc * 1.2
-            elif scale_low is None and 'CDELT1' in hdr:
-                sc = abs(float(hdr['CDELT1'])) * 3600.0
-                scale_low = sc * 0.8
-                scale_high = sc * 1.2
-        except Exception:
-            pass
-
-    # Temp dir under the target's _sho_work (still inside the workspace, so the
-    # container sees it under /astro/...) — keeps all derived files in one place.
-    work_dir = os.path.join(os.path.dirname(os.path.abspath(fits_path)),
-                            '_sho_work', '_solve_tmp')
+    work_dir = os.path.join(os.path.dirname(fits_path), '_sho_work', '_solve_tmp')
     os.makedirs(work_dir, exist_ok=True)
 
+    referer = api_base + 'login'
     try:
-        # Container paths
-        container_fits = _host_to_container(fits_path)
-        container_work = '/astro/_solve_tmp'
-
-        # Build solve-field args
-        sf_args = [
-            'solve-field',
-            container_fits,
-            '--backend-config', '/index/docker.cfg',
-            '--dir', container_work,
-            '--overwrite',
-            '--no-plots',
-            '--no-verify',
-            '--crpix-center',
-            '--tweak-order', '2',
-            '--downsample', str(downsample),
-        ]
-
-        if scale_low is not None and scale_high is not None:
-            sf_args += ['--scale-units', 'arcsecperpix',
-                        '--scale-low', str(scale_low),
-                        '--scale-high', str(scale_high)]
-
-        if ra_hint is not None and dec_hint is not None:
-            sf_args += ['--ra', str(ra_hint),
-                        '--dec', str(dec_hint),
-                        '--radius', str(radius)]
-
-        # Run via docker compose exec in the astrometry service
-        cmd = [
-            'docker', 'compose', 'exec', '-T', 'astrometry',
-        ] + sf_args
-
-        log_fn(f"  Plate-solving {base} ...")
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True, text=True,
+        log_fn(f"  Plate-solving {base} via {api_base} ...")
+        login = _request_json(
+            api_base + 'login',
+            payload={'request-json': json.dumps({'apikey': api_key})},
+            headers={'Referer': referer},
             timeout=timeout,
-            cwd=workspace(),  # so docker compose finds docker-compose.yml
         )
-
-        # Check for solution (output files are in _solve_tmp on host)
-        solved_file = os.path.join(work_dir, f'{stem}.solved')
-        wcs_file = os.path.join(work_dir, f'{stem}.wcs')
-
-        if not os.path.exists(solved_file):
-            log_fn(f"  Plate-solve FAILED for {base}")
-            # Show useful output lines
-            output = result.stdout or result.stderr or ''
-            for line in output.strip().split('\n')[-8:]:
-                if line.strip():
-                    log_fn(f"    {line}")
+        if login.get('status') != 'success' or not login.get('session'):
+            log_fn(f"  Plate-solve login failed: {login}")
             return None
 
-        # Read WCS from the .wcs file
+        upload_payload, ra_hint, dec_hint = _solve_scale_hints(fits_path)
+        upload = _upload_file(api_base, login['session'], fits_path,
+                              upload_payload, timeout=timeout)
+        if upload.get('status') != 'success' or 'subid' not in upload:
+            log_fn(f"  Plate-solve upload failed: {upload}")
+            return None
+
+        subid = int(upload['subid'])
+        jobid = None
+        deadline = time.monotonic() + timeout
+        last_status = None
+
+        while time.monotonic() < deadline:
+            sub = _request_json(api_base + f'submissions/{subid}', timeout=60)
+            jobs = sub.get('jobs', []) or []
+            jobid = next((j for j in jobs if j is not None), None)
+            if jobid is not None:
+                job = _request_json(api_base + f'jobs/{jobid}', timeout=60)
+                last_status = job.get('status')
+                if last_status == 'success':
+                    break
+                if last_status in {'failure', 'failed', 'cancelled'}:
+                    log_fn(f"  Plate-solve failed: {job}")
+                    return None
+            else:
+                last_status = sub.get('status')
+            time.sleep(5)
+
+        if jobid is None:
+            log_fn(f"  Plate-solve timed out waiting for a job (submission {subid})")
+            return None
+
+        if last_status != 'success':
+            log_fn(f"  Plate-solve timed out waiting for success (job {jobid})")
+            return None
+
+        wcs_file = os.path.join(work_dir, f'{stem}.wcs')
+        wcs_url = _api_root(api_base).rstrip('/') + f'/wcs_file/{jobid}'
+        _download_binary(wcs_url, wcs_file, timeout=timeout)
+
         wcs_hdr = read_fits_header(wcs_file)
         wcs_dict = {}
-        for key in wcs_hdr:
+        for key, val in wcs_hdr.items():
             if key in _WCS_KEYS or key.startswith(('A_', 'B_', 'AP_', 'BP_')):
-                # Convert numeric values from strings to floats.
-                # read_fits_header returns everything as strings; FITS
-                # WCS keywords must be numeric for Siril compatibility.
-                val = wcs_hdr[key]
                 try:
                     val = float(val)
                 except (ValueError, TypeError):
-                    pass  # keep as string (e.g. CTYPE1 = 'RA---TAN')
+                    pass
                 wcs_dict[key] = val
 
-        # Compute CROTA2 from CD matrix if not directly present
         if 'CROTA2' not in wcs_dict and 'CD1_1' in wcs_dict and 'CD1_2' in wcs_dict:
             cd11 = float(wcs_dict['CD1_1'])
             cd12 = float(wcs_dict['CD1_2'])
@@ -179,13 +306,9 @@ def plate_solve(fits_path, *, timeout=300, scale_low=None, scale_high=None,
         dec_s = f"{float(wcs_dict.get('CRVAL2', 0)):.4f}"
         rot_s = f"{float(wcs_dict.get('CROTA2', 0)):.2f}"
         log_fn(f"  Solved! RA={ra_s}  DEC={dec_s}  rot={rot_s}°")
-
         return wcs_dict
 
-    except subprocess.TimeoutExpired:
-        log_fn(f"  Plate-solve TIMEOUT for {base}")
-        return None
-    except Exception as e:
+    except (HTTPError, URLError, OSError, json.JSONDecodeError, ValueError) as e:
         log_fn(f"  Plate-solve ERROR: {e}")
         return None
     finally:

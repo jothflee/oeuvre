@@ -13,14 +13,19 @@ a session and assemble them into a wide-field mosaic automatically.
 
 Registration everywhere (sub stacking, channel alignment, mosaic panels) uses a
 single star-centroid + asterism matcher. Star removal shells out to a local
-StarNet++ binary; plate solving (optional) uses a local astrometry.net Docker
-service.
+StarNet++ binary; plate solving (optional) uses an astrometry.net API endpoint
+configured in the app's Settings tab.
 
 ## Requirements
 
 - Python ≥ 3.11
 - Runtime deps (resolved automatically): numpy, scipy, opencv-python, astropy, pillow
-- [StarNet++ v2 CLI](https://www.starnetastro.com/) for star removal (external binary, not bundled)
+- [StarNet++ v2 CLI](https://starnetastro.com/cli-tools/starnet/) for star removal (external binary, not bundled)
+
+StarNet is optional but recommended for the cleanest star removal. Oeuvre never
+rehosts it; the first-run setup flow opens the official StarNet site in your
+browser so you can accept StarNet's license yourself and download the binary
+directly from the source.
 
 ## Install
 
@@ -37,11 +42,31 @@ Or with pip: `pip install .`
 bundles for macOS and Linux are also attached to each
 [GitHub Release](https://github.com/jothflee/oeuvre/releases).
 
+## StarNet setup
+
+On first launch, use the `Open official download` button in the app to open the
+StarNet v2 download page in your browser. After you download and extract the
+archive, choose the extracted `StarNetv2CLI_MacOS` folder in Oeuvre.
+
+Oeuvre copies that folder into `~/oeuvre/StarNetv2CLI_MacOS` so it is easy to
+find, update, and remove later. You can delete only the local copy from the app
+without touching the original download.
+
+## Settings
+
+Use the app's Settings tab to configure plate solving:
+
+- Astrometry.net API endpoint, for example `https://nova.astrometry.net/api/`
+- Your Astrometry.net API key
+
+If StarNet is missing, the Processing tab shows a warning and points you back
+to Settings.
+
 ## Data location (workspace)
 
 Code and data are separate. The **workspace** is the data root — target
 directories, shared `darks/`, the `StarNetv2CLI_MacOS/` binary, and (optionally)
-`docker-compose.yaml` for plate solving. Resolved in order:
+the optional StarNet helper. Resolved in order:
 
 1. `OEUVRE_WORKSPACE` env var, or the `--workspace` flag
 2. default: `~/oeuvre-astro` (created automatically if missing)
@@ -51,8 +76,10 @@ directories, shared `darks/`, the `StarNetv2CLI_MacOS/` binary, and (optionally)
   NGC6888/Light/Ha-7nm/*.fits     # target frames, grouped by filter
   darks/*.fits                    # shared dark frames
   StarNetv2CLI_MacOS/starnet++    # star removal binary
-  docker-compose.yaml             # optional, for plate solving
 ```
+
+The optional StarNet helper is managed separately under `~/oeuvre/` so you can
+install or uninstall it without affecting your target data workspace.
 
 ## Usage
 

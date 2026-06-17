@@ -2475,13 +2475,15 @@ class SHOPipeline:
 
         # Plate-solve the output to embed full WCS (rotation, distortion)
         try:
-            from .plate_solve import plate_solve as _plate_solve
+            from .plate_solve import plate_solve_if_needed as _plate_solve
             from .plate_solve import update_fits_wcs as _update_wcs
-            self.log(f"  Plate-solving output for WCS ...")
+            self.log(f"  Checking output WCS ...")
             wcs = _plate_solve(fits_path, log_fn=self.log)
             if wcs:
                 _update_wcs(fits_path, wcs, log_fn=self.log)
-            else:
+            elif not os.path.isfile(fits_path):
+                self.log(f"  (plate-solve unavailable — WCS not added)")
+            elif not wcs:
                 self.log(f"  (plate-solve unavailable — WCS not added)")
         except Exception as e:
             self.log(f"  (plate-solve skipped: {e})")
