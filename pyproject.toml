@@ -1,6 +1,6 @@
 [project]
 name = "oeuvre"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automated SHO narrowband astrophotography pipeline — a night's subs to a finished image, aiming at full-sky mosaics"
 readme = "README.md"
 requires-python = ">=3.11"
