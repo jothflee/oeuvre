@@ -12,16 +12,36 @@ Public API mirrors the old `siril_star_removal`:
 """
 
 import os
+import platform
 import shutil
 import subprocess
+import threading
 
 import numpy as np
 import cv2
 
-from .config import workspace, app_home
 
-STARNET_DIR_NAME = 'StarNetv2CLI_MacOS'
-STARNET_BINARY_NAME = 'starnet++'
+def _rosetta_note(binp):
+    """Warn string if a non-arm64 binary will run under Rosetta on this Mac."""
+    if platform.system() != 'Darwin' or platform.machine() != 'arm64':
+        return ''
+    try:
+        archs = subprocess.run(['/usr/bin/file', '-b', binp],
+                               capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return ''
+    if 'arm64' not in archs and 'x86_64' in archs:
+        return ('  NOTE: this is an x86_64 StarNet build running under Rosetta '
+                'on Apple Silicon — much slower. Use an arm64 build for speed.')
+    return ''
+
+from .config import workspace, app_home, starnet_dir_setting
+
+STARNET_DIR_NAME = 'StarNetv2CLI_MacOS'  # legacy default folder, still auto-found
+# Known StarNet CLI executables, in preference order. 'starnet2' is the modern
+# StarNet v2 (ONNX Runtime) build; 'starnet++' is the legacy binary. We prefer
+# v2 wherever both exist.
+STARNET_BINARY_NAMES = ('starnet2', 'starnet++')
 STARNET_OFFICIAL_URL = 'https://starnetastro.com/cli-tools/starnet/'
 
 
@@ -30,27 +50,75 @@ def managed_starnet_dir():
     return os.path.join(app_home(), STARNET_DIR_NAME)
 
 
-def starnet_binary_path(starnet_dir):
-    """Return the StarNet binary path for a given directory."""
-    return os.path.join(starnet_dir, STARNET_BINARY_NAME)
+def starnet_binary_path(starnet_dir, names=None):
+    """Return the path to a usable StarNet binary inside *starnet_dir*.
+
+    Checks the known executable names (``names`` overrides, default preference
+    order = StarNet v2 first), returning the first one that exists and is
+    executable, or ``None`` if the folder has no usable StarNet binary.
+    """
+    if not starnet_dir:
+        return None
+    for cand in (names or STARNET_BINARY_NAMES):
+        p = os.path.join(starnet_dir, cand)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def strip_quarantine(path, log=None):
+    """Remove the macOS com.apple.quarantine xattr from *path* (recursively).
+
+    Browser-downloaded StarNet builds arrive quarantined; on first real use the
+    CLI loads its bundled runtime dylibs and Gatekeeper stalls verifying each
+    quarantined file, which looks exactly like a hang. Clearing the attribute up
+    front avoids that. No-op off macOS / on failure.
+    """
+    import sys
+    import subprocess
+    if sys.platform != 'darwin' or not path or not os.path.exists(path):
+        return
+    try:
+        r = subprocess.run(['xattr', '-dr', 'com.apple.quarantine', path],
+                           capture_output=True, timeout=30)
+        if log and r.returncode == 0:
+            log(f"  Cleared macOS quarantine on {os.path.basename(path)}")
+    except Exception:
+        pass
+
+
+def _starnet_argv(binp, in_tif, out_tif):
+    """Build the CLI argv for whichever StarNet binary *binp* is.
+
+    StarNet v2 ('starnet2', ONNX Runtime) takes named --input/--output options;
+    the legacy 'starnet++' takes positional input/output. Both load their model
+    weights from their own directory, so callers run with cwd set there.
+    """
+    name = os.path.basename(binp).lower()
+    if name.startswith('starnet2'):
+        return [binp, '--input', in_tif, '--output', out_tif]
+    return [binp, in_tif, out_tif]
 
 
 def _is_valid_starnet_dir(path):
-    """Check whether *path* looks like an extracted StarNet v2 folder."""
+    """True when *path* contains a usable StarNet binary (v2 or legacy)."""
     if not path or not os.path.isdir(path):
         return False
-    binp = starnet_binary_path(path)
-    return os.path.isfile(binp) and os.access(binp, os.X_OK)
+    return starnet_binary_path(path) is not None
 
 
 def resolve_starnet_source(path):
-    """Resolve a user-selected path to the StarNet folder to install/copy."""
+    """Resolve a user-selected path to a usable StarNet folder.
+
+    Accepts the folder itself, a path to a known StarNet binary, or a parent
+    that contains a StarNetv2CLI_MacOS subfolder. Returns the folder, or None.
+    """
     if not path:
         return None
     path = os.path.abspath(os.path.expanduser(path))
     if os.path.isfile(path):
         parent = os.path.dirname(path)
-        if os.path.basename(path) == STARNET_BINARY_NAME:
+        if os.path.basename(path) in STARNET_BINARY_NAMES:
             return parent if _is_valid_starnet_dir(parent) else None
         return None
     if _is_valid_starnet_dir(path):
@@ -71,39 +139,19 @@ def starnet_status():
     """Summarize the current StarNet discovery state."""
     binp, sn_dir = find_starnet()
     managed_dir = installed_starnet_dir()
+    chosen = starnet_dir_setting() or None
     return {
         'available': bool(binp),
         'binary': binp,
+        'binary_name': os.path.basename(binp) if binp else None,
         'dir': sn_dir,
         'managed_dir': managed_dir,
         'managed_root': managed_starnet_dir(),
+        'chosen_dir': chosen,
+        # True when the active install is the one the user explicitly chose.
+        'chosen_active': bool(chosen and sn_dir
+                              and os.path.abspath(chosen) == os.path.abspath(sn_dir)),
     }
-
-
-def install_starnet(source_path):
-    """Copy an extracted StarNet folder into the managed ~/oeuvre home."""
-    src = resolve_starnet_source(source_path)
-    if src is None:
-        raise ValueError(
-            'Selected folder does not look like an extracted StarNet v2 '
-            'install.')
-
-    dest = managed_starnet_dir()
-    os.makedirs(app_home(), exist_ok=True)
-    if os.path.abspath(src) == os.path.abspath(dest):
-        return dest
-
-    if os.path.exists(dest):
-        if os.path.islink(dest) or os.path.isfile(dest):
-            os.unlink(dest)
-        else:
-            shutil.rmtree(dest)
-    shutil.copytree(src, dest)
-
-    binp = starnet_binary_path(dest)
-    if os.path.isfile(binp):
-        os.chmod(binp, 0o755)
-    return dest
 
 
 def uninstall_managed_starnet():
@@ -119,26 +167,54 @@ def uninstall_managed_starnet():
 
 
 def find_starnet():
-    """Locate the StarNet++ CLI directory and binary.
+    """Locate a StarNet CLI directory and binary.
 
-    Returns (binary_path, starnet_dir) or (None, None) if not found.
-    Honors the STARNET_DIR environment variable as an override, then looks for
-    a managed local install under ``~/oeuvre``, then the workspace and current
-    directory.
+    Returns (binary_path, starnet_dir) or (None, None).
+
+    Resolution order:
+      1. Explicit overrides — the STARNET_DIR env var, then the user-chosen
+         folder from settings — win and use whatever binary they contain.
+      2. Otherwise search the managed install, the legacy workspace/cwd folders,
+         and any ``*starnet*`` folder under the workspace / app home (so a
+         versioned download like ``starnet2_macos-..._cli`` is auto-discovered),
+         preferring a StarNet v2 ('starnet2') binary over the legacy 'starnet++'.
     """
-    candidates = []
-    env_dir = os.environ.get('STARNET_DIR')
-    if env_dir:
-        candidates.append(env_dir)
-    candidates += [
+    # 1. Explicit overrides — honor the user's exact choice (any binary).
+    for d in (os.environ.get('STARNET_DIR'), starnet_dir_setting()):
+        if d:
+            binp = starnet_binary_path(d)
+            if binp:
+                return binp, d
+
+    # 2. Known + discovered locations.
+    candidates = [
         managed_starnet_dir(),
-        os.path.join(workspace(), 'StarNetv2CLI_MacOS'),
-        os.path.join(os.getcwd(), 'StarNetv2CLI_MacOS'),
+        os.path.join(workspace(), STARNET_DIR_NAME),
+        os.path.join(os.getcwd(), STARNET_DIR_NAME),
     ]
+    for root in (workspace(), app_home()):
+        try:
+            candidates += [
+                os.path.join(root, e) for e in sorted(os.listdir(root))
+                if 'starnet' in e.lower()
+                and os.path.isdir(os.path.join(root, e))
+            ]
+        except OSError:
+            pass
+
+    seen, uniq = set(), []
     for d in candidates:
-        binp = starnet_binary_path(d)
-        if os.path.isfile(binp) and os.access(binp, os.X_OK):
-            return binp, d
+        ad = os.path.abspath(d)
+        if ad not in seen:
+            seen.add(ad)
+            uniq.append(d)
+
+    # Prefer StarNet v2 anywhere before falling back to the legacy binary.
+    for prefer in (('starnet2',), ('starnet++',)):
+        for d in uniq:
+            binp = starnet_binary_path(d, names=prefer)
+            if binp:
+                return binp, d
     return None, None
 
 
@@ -188,24 +264,50 @@ def remove_stars(rgb_fits_path, work_dir, log=print, timeout=1800):
     binp, sn_dir = find_starnet()
     if binp is None:
         raise RuntimeError(
-            "StarNet++ binary not found. Use Oeuvre's StarNet setup or set "
-            f"STARNET_DIR. Expected {starnet_binary_path(managed_starnet_dir())} "
-            "or the workspace copy."
+            "StarNet binary not found (looked for "
+            f"{' / '.join(STARNET_BINARY_NAMES)}). Choose a StarNet folder in "
+            "Oeuvre's settings or set STARNET_DIR."
         )
+
+    # Clear quarantine so loading the bundled runtime dylibs can't stall.
+    strip_quarantine(sn_dir, log=log)
 
     original = _to_hwc(load_fits(rgb_fits_path)[0])
 
-    in_tif = os.path.join(work_dir, '_starnet_in.tif')
-    out_tif = os.path.join(work_dir, '_starnet_out.tif')
+    # Absolute paths so they resolve regardless of the StarNet cwd.
+    in_tif = os.path.abspath(os.path.join(work_dir, '_starnet_in.tif'))
+    out_tif = os.path.abspath(os.path.join(work_dir, '_starnet_out.tif'))
     _write_tiff16(original, in_tif)
 
-    log(f"  Running StarNet++ ({original.shape[1]}x{original.shape[0]})...")
-    # Run from the StarNet dir so it finds its weights + tensorflow dylibs.
-    result = subprocess.run(
-        [binp, in_tif, out_tif],
-        cwd=sn_dir,
-        capture_output=True, text=True, timeout=timeout,
-    )
+    mp = original.shape[0] * original.shape[1] / 1e6
+    log(f"  Running {os.path.basename(binp)} "
+        f"({original.shape[1]}x{original.shape[0]}, {mp:.1f} MP) — "
+        f"large images can take several minutes...")
+    note = _rosetta_note(binp)
+    if note:
+        log(note)
+
+    # Heartbeat so a long (silent, captured) run doesn't look hung.
+    done = threading.Event()
+
+    def _heartbeat():
+        secs = 0
+        while not done.wait(30):
+            secs += 30
+            log(f"  ...{os.path.basename(binp)} still running "
+                f"({secs // 60}m{secs % 60:02d}s)")
+
+    hb = threading.Thread(target=_heartbeat, daemon=True)
+    hb.start()
+    # Run from the StarNet dir so it finds its bundled weights + runtime libs.
+    try:
+        result = subprocess.run(
+            _starnet_argv(binp, in_tif, out_tif),
+            cwd=sn_dir,
+            capture_output=True, text=True, timeout=timeout,
+        )
+    finally:
+        done.set()
     if result.returncode != 0 or not os.path.exists(out_tif):
         err = (result.stderr or result.stdout)[:500]
         raise RuntimeError(f"StarNet failed (exit {result.returncode}):\n{err}")

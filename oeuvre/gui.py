@@ -20,10 +20,11 @@ from PIL import Image, ImageDraw, ImageFont
 from .pipeline import run_pipeline, scan_targets, PipelineConfig
 from .config import (
     workspace,
-    app_home,
-    ensure_app_home,
     plate_solve_settings,
     save_plate_solve_settings,
+    stack_workers_setting,
+    save_stack_workers_setting,
+    save_starnet_dir_setting,
 )
 from .projection import SkyMap
 from .starfield import render_starfield
@@ -32,7 +33,8 @@ from .starnet import (
     STARNET_OFFICIAL_URL,
     managed_starnet_dir,
     starnet_status,
-    install_starnet,
+    resolve_starnet_source,
+    strip_quarantine,
     uninstall_managed_starnet,
 )
 
@@ -282,62 +284,48 @@ class OeuvreApp:
         except Exception:
             pass
 
-    def _refresh_starnet_ui(self):
-        status = starnet_status()
-        managed_dir = status['managed_dir'] or status['managed_root']
-        if status['available']:
-            if status['dir'] == managed_dir:
-                text = f'Installed locally at {managed_dir}'
-            else:
-                text = f'Found at {status["dir"]}'
-        else:
-            text = (
-                f'Not installed. Open the official site, accept the StarNet '
-                f'license, and install into {managed_dir}')
-        self.starnet_status_var.set(text)
-        if hasattr(self, 'starnet_remove_btn'):
-            self.starnet_remove_btn.configure(
-                state='normal' if status['managed_dir'] else 'disabled')
-
     def _open_starnet_download(self):
         webbrowser.open(STARNET_OFFICIAL_URL, new=2, autoraise=True)
         self._log(
             f'Opened the official StarNet v2 site: {STARNET_OFFICIAL_URL}')
 
-    def _install_starnet(self):
-        ensure_app_home()
+    def _choose_starnet(self):
+        """Point Oeuvre at a StarNet folder (v2 'starnet2' or legacy 'starnet++')
+        and persist the choice so it survives restarts and shows in settings."""
         path = filedialog.askdirectory(
-            initialdir=app_home(),
-            title='Select extracted StarNetv2CLI_MacOS folder',
+            initialdir=workspace(),
+            title='Select your StarNet folder (containing starnet2 or starnet++)',
         )
         if not path:
             return
-        try:
-            dest = install_starnet(path)
-            self._log(f'✓ Installed StarNet to {dest}')
-            self._refresh_starnet_ui()
-        except Exception as e:
-            self._log(f'✗ StarNet install failed: {e}')
+        resolved = resolve_starnet_source(path)
+        if resolved is None:
+            self._log('✗ That folder has no StarNet binary '
+                      '(looked for starnet2 / starnet++).')
+            return
+        # Clear macOS quarantine now so the first run can't stall on Gatekeeper.
+        strip_quarantine(resolved, log=self._log)
+        save_starnet_dir_setting(resolved)
+        status = starnet_status()
+        self._log(f'✓ Using StarNet: {status["binary_name"]} at {resolved}')
+        self._refresh_starnet_ui()
 
-    def _remove_starnet(self):
+    def _reset_starnet(self):
+        """Clear the chosen folder (revert to auto-detect); optionally delete a
+        leftover oeuvre-managed copy."""
+        save_starnet_dir_setting('')
         dest = managed_starnet_dir()
-        if not os.path.isdir(dest):
-            self._log('No local StarNet install found to remove')
-            self._refresh_starnet_ui()
-            return
-        if not messagebox.askyesno(
-            'Remove local StarNet copy',
-            f'Remove the local StarNet folder from\n{dest}\n\n'
-            'This only deletes the oeuvre-managed copy, not the official '
-            'download you obtained from StarNet.',
+        if os.path.isdir(dest) and messagebox.askyesno(
+            'Remove managed copy',
+            f'Also delete the oeuvre-managed StarNet copy at\n{dest}?',
         ):
-            return
-        try:
-            uninstall_managed_starnet()
-            self._log(f'✓ Removed local StarNet copy from {dest}')
-            self._refresh_starnet_ui()
-        except Exception as e:
-            self._log(f'✗ StarNet removal failed: {e}')
+            try:
+                uninstall_managed_starnet()
+                self._log(f'✓ Removed managed copy at {dest}')
+            except Exception as e:
+                self._log(f'✗ StarNet removal failed: {e}')
+        self._log('✓ StarNet set to auto-detect')
+        self._refresh_starnet_ui()
 
     # ── UI construction ─────────────────────────────────────────────────
 
@@ -460,11 +448,13 @@ class OeuvreApp:
         opt.pack(fill='x', padx=16, pady=(0, 6))
         ttk.Checkbutton(opt, text='Clear cache (full reprocess from raw)',
                         variable=self.clear_cache_var).pack(side='left')
+        ttk.Checkbutton(opt, text='Recolour only (reuse StarNet — fast colour tweaks)',
+                        variable=self.recolor_var).pack(side='left', padx=(16, 0))
 
         sld = tk.Frame(controls, bg=BG)
         sld.pack(fill='x', padx=16, pady=(0, 6))
         self.hue_strength_var = tk.DoubleVar(value=0.44)
-        self.oiii_factor_var = tk.DoubleVar(value=0.38)
+        self.oiii_factor_var = tk.DoubleVar(value=0.15)
         self._make_slider(sld, 'Gold', self.hue_strength_var, 0.0, 1.0)
         self._make_slider(sld, 'Blue', self.oiii_factor_var, 0.0, 1.0,
                           padx=(24, 0))
@@ -482,11 +472,13 @@ class OeuvreApp:
         preview_card, preview_bg = card()
         ttk.Label(preview_card, text='Preview', style='Dim.TLabel').pack(
             anchor='w', padx=12, pady=(8, 0))
-        self.preview_canvas = tk.Canvas(preview_card, bg=BG_LIGHT, relief='flat',
+        # Canvas background is the deep-space tone (not an opaque light box) so
+        # the preview reads as part of the frosted starfield, never a panel.
+        self.preview_canvas = tk.Canvas(preview_card, bg=SPACE, relief='flat',
                                         highlightthickness=0)
         self.preview_canvas.pack(fill='both', expand=True, padx=12, pady=(4, 12))
         self.preview_placeholder = tk.Label(
-            self.preview_canvas, bg=BG_LIGHT,
+            self.preview_canvas, bg=SPACE,
             text='Pipeline preview will appear here', fg=DIM, font=FONT_SMALL)
         self.preview_placeholder.place(relx=0.5, rely=0.5, anchor='center')
 
@@ -535,15 +527,17 @@ class OeuvreApp:
         sn_row.pack(fill='x', padx=16)
         ttk.Button(sn_row, text='Open official download',
                    command=self._open_starnet_download).pack(side='left')
-        ttk.Button(sn_row, text='Install / choose folder…',
-                   command=self._install_starnet).pack(side='left', padx=(8, 0))
+        ttk.Button(sn_row, text='Choose StarNet folder…',
+                   command=self._choose_starnet).pack(side='left', padx=(8, 0))
         self.starnet_remove_btn = ttk.Button(
-            sn_row, text='Remove local copy', command=self._remove_starnet)
+            sn_row, text='Reset to auto-detect', command=self._reset_starnet)
         self.starnet_remove_btn.pack(side='left', padx=(8, 0))
 
         ttk.Label(sn_card,
-                  text='Oeuvre only guides you to the official download and keeps '
-                       'a local copy under ~/oeuvre for easy removal.',
+                  text='Point Oeuvre at your extracted StarNet folder — the '
+                       'modern StarNet v2 ("starnet2") is preferred over the '
+                       'legacy "starnet++". Your choice is remembered and shown '
+                       'above.',
                   style='Dim.TLabel', wraplength=1120, justify='left').pack(
                       anchor='w', padx=16, pady=(12, 0))
 
@@ -551,8 +545,8 @@ class OeuvreApp:
         ps_card = card('Plate Solving')
         ps_card.pack(fill='x')
         ps_info = (
-            'Astrometry.net API base URL and API key. '
-            'Default is the public Nova astrometry.net API.')
+            'Astrometry.net API base URL and optional API key. '
+            'Local astrometry.net deployments can work without a key.')
         ttk.Label(ps_card, text=ps_info, style='Dim.TLabel', wraplength=1120,
                   justify='left').pack(anchor='w', padx=16, pady=(0, 12))
 
@@ -567,7 +561,8 @@ class OeuvreApp:
         endpoint_entry = ttk.Entry(form, textvariable=self.plate_endpoint_var, width=64)
         endpoint_entry.grid(row=1, column=0, columnspan=3, sticky='ew', pady=(4, 10))
 
-        ttk.Label(form, text='API key').grid(row=2, column=0, sticky='w')
+        ttk.Label(form, text='API key (optional for local deployments)').grid(
+            row=2, column=0, sticky='w')
         api_key_entry = ttk.Entry(form, textvariable=self.plate_api_key_var, width=64,
                                   show='*')
         api_key_entry.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(4, 10))
@@ -595,24 +590,73 @@ class OeuvreApp:
 
         self._refresh_plate_solve_ui()
 
+        # Processing / concurrency card
+        proc_card = card('Processing')
+        proc_card.pack(fill='x')
+        ttk.Label(proc_card,
+                  text='Number of panel/filter stacks to calibrate + register + '
+                       'stack at the same time. Higher is faster on multi-core '
+                       'machines but uses more memory (each stack holds all its '
+                       'subs at once). 0 = automatic.',
+                  style='Dim.TLabel', wraplength=1120, justify='left').pack(
+                      anchor='w', padx=16, pady=(0, 12))
+
+        self.stack_workers_var = tk.IntVar(value=stack_workers_setting())
+        sw_form = tk.Frame(proc_card, bg=BG)
+        sw_form.pack(fill='x', padx=16)
+        ttk.Label(sw_form, text='Concurrent stack jobs (0 = auto)').pack(side='left')
+        ttk.Spinbox(sw_form, from_=0, to=16, width=6,
+                    textvariable=self.stack_workers_var).pack(side='left', padx=(8, 0))
+        ttk.Button(sw_form, text='Save',
+                   command=self._save_stack_workers).pack(side='left', padx=(8, 0))
+
+        self.stack_workers_status_var = tk.StringVar(value='')
+        ttk.Label(proc_card, textvariable=self.stack_workers_status_var,
+                  style='Dim.TLabel').pack(anchor='w', padx=16, pady=(8, 12))
+        self._refresh_stack_workers_ui()
+
+    def _refresh_stack_workers_ui(self):
+        if not hasattr(self, 'stack_workers_status_var'):
+            return
+        n = stack_workers_setting()
+        self.stack_workers_status_var.set(
+            'Concurrent stacking: automatic'
+            if n <= 0 else f'Concurrent stacking: {n} job(s)')
+
+    def _save_stack_workers(self):
+        try:
+            workers = int(self.stack_workers_var.get())
+        except (tk.TclError, ValueError):
+            workers = 0
+        workers = max(0, min(16, workers))
+        save_stack_workers_setting(workers)
+        self.stack_workers_var.set(workers)
+        self._refresh_stack_workers_ui()
+        self._log(f'✓ Saved concurrent stack jobs: '
+                  f'{"auto" if workers == 0 else workers}')
+
     def _refresh_starnet_ui(self):
         status = starnet_status()
-        managed_dir = status['managed_dir'] or status['managed_root']
         if status['available']:
-            if status['dir'] == managed_dir:
-                text = f'Installed locally at {managed_dir}'
+            d, name = status['dir'], status['binary_name']
+            if status['chosen_active']:
+                text = f'Using your chosen StarNet ({name}):  {d}'
+            elif status['managed_dir'] and os.path.abspath(d) == os.path.abspath(
+                    status['managed_dir']):
+                text = f'Installed locally ({name}) at {d}'
             else:
-                text = f'Found at {status["dir"]}'
+                text = f'Auto-detected {name} at {d}'
             warning = ''
         else:
-            text = (
-                f'Not installed. Open the official site, accept the StarNet '
-                f'license, and install into {managed_dir}')
+            text = ('No StarNet found. Open the official site, download StarNet '
+                    'v2, then "Choose StarNet folder…" below.')
             warning = 'Warning: StarNet is not installed. See Settings.'
         self.starnet_status_var.set(text)
+        # Enable reset when there is an explicit choice or a managed copy to clear.
         if hasattr(self, 'starnet_remove_btn'):
+            can_reset = bool(status['chosen_dir'] or status['managed_dir'])
             self.starnet_remove_btn.configure(
-                state='normal' if status['managed_dir'] else 'disabled')
+                state='normal' if can_reset else 'disabled')
         if hasattr(self, 'starnet_warning_var'):
             self.starnet_warning_var.set(warning)
 
@@ -629,7 +673,8 @@ class OeuvreApp:
                 self.plate_status_var.set(f'Configured endpoint: {endpoint}')
             else:
                 self.plate_status_var.set(
-                    f'Endpoint: {endpoint}  |  API key missing')
+                    f'Endpoint: {endpoint}  |  API key optional for local '
+                    f'deployments')
 
     def _reset_plate_solve_endpoint(self):
         self.plate_endpoint_var.set('https://nova.astrometry.net/api/')
@@ -839,6 +884,8 @@ class OeuvreApp:
         for p in paths:
             try:
                 sf = self.skymap.add_file(p, log_fn=self._proj_log)
+                if sf is None:
+                    continue
                 self.proj_listbox.insert('end', sf.label)
                 self._proj_log(
                     f"✓ {sf.label}  RA={sf.ra_deg:.3f}°  "
@@ -1064,15 +1111,17 @@ class OeuvreApp:
         self.log_text.delete('1.0', 'end')
         self.log_text.configure(state='disabled')
 
-        # Reset preview
+        # Reset preview to the transparent frosted starfield — no opaque
+        # "processing" box. Progress is shown in the status line and log.
+        if getattr(self, 'preview_placeholder', None) is not None:
+            self.preview_placeholder.place_forget()
+            self.preview_placeholder = None
         self.preview_canvas.delete('all')
         self.tk_preview._canvas_image_id = None
-        self.preview_placeholder = tk.Label(
-            self.preview_canvas, bg=BG_LIGHT,
-            text='Processing…', fg=DIM, font=FONT_SMALL,
-        )
-        self.preview_placeholder.place(relx=0.5, rely=0.5, anchor='center')
-        self.tk_preview._placeholder = self.preview_placeholder
+        self.tk_preview._content = None
+        self.tk_preview._placeholder = None
+        self.tk_preview._panel_images = []
+        self.tk_preview._render()  # re-composite the starfield (no content yet)
 
         cfg = PipelineConfig(
             target=target_path,
@@ -1083,6 +1132,7 @@ class OeuvreApp:
             truthful_mode=self.truthful_var.get(),
             hue_strength=round(self.hue_strength_var.get(), 3),
             oiii_factor=round(self.oiii_factor_var.get(), 3),
+            stack_workers=stack_workers_setting(),
             no_preview=True,   # disable cv2 windows
             interactive=False,
             log_callback=self._log,

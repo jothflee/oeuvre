@@ -74,17 +74,6 @@ def render_starfield(width, height, seed=7, n_stars=None):
     return Image.fromarray(np.clip(img, 0, 255).astype(np.uint8), 'RGB')
 
 
-def frost_crop(base, box, tint=(20, 24, 34), tint_alpha=16, blur=2):
-    """Return a box-sized frosted-glass tile: a blurred crop of the starfield
-    under a light neutral tint. Used as a live panel background so the stars
-    read straight through the glass.
-    """
-    crop = base.crop(box).filter(ImageFilter.GaussianBlur(blur)).convert('RGBA')
-    card = Image.alpha_composite(
-        crop, Image.new('RGBA', crop.size, (*tint, tint_alpha)))
-    return card.convert('RGB')
-
-
 def _rounded_mask(w, h, radius):
     m = Image.new('L', (w, h), 0)
     ImageDraw.Draw(m).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=255)
@@ -110,47 +99,6 @@ def glass_card(base, box, radius=18, tint=(38, 42, 50), tint_alpha=24,
     out = base.convert('RGBA')
     out.paste(card, (x0, y0), _rounded_mask(cw, ch, radius))
     return out.convert('RGB')
-
-
-def make_icon(size=1024):
-    """Render the Oeuvre app icon: a glowing ✦ star over a deep-space squircle."""
-    S = size
-    ss = 2                                   # supersample for smooth edges
-    w = S * ss
-    img = render_starfield(w, w, seed=3, n_stars=w * w // 1400).convert('RGB')
-    arr = np.asarray(img, np.float32)
-
-    # Central 4-point star (✦): outer points N/E/S/W, inner points between.
-    cx = cy = w / 2.0
-    R, r = w * 0.34, w * 0.34 * 0.30
-    pts = []
-    for i in range(8):
-        ang = np.radians(-90 + i * 45)
-        rad = R if i % 2 == 0 else r
-        pts.append((cx + rad * np.cos(ang), cy + rad * np.sin(ang)))
-    star = Image.new('L', (w, w), 0)
-    ds = ImageDraw.Draw(star)
-    ds.polygon(pts, fill=255)
-    ds.ellipse([cx - w / 18, cy - w / 18, cx + w / 18, cy + w / 18], fill=255)
-
-    s = np.asarray(star, np.float32) / 255.0
-    glow = np.asarray(star.filter(ImageFilter.GaussianBlur(w // 36)),
-                      np.float32) / 255.0
-    arr = np.clip(arr
-                  + glow[:, :, None] * np.array([95, 135, 205], np.float32)
-                  + s[:, :, None] * np.array([185, 212, 255], np.float32),
-                  0, 255)
-
-    icon = Image.fromarray(arr.astype(np.uint8), 'RGB').convert('RGBA')
-    # Squircle mask + subtle edge.
-    mask = Image.new('L', (w, w), 0)
-    ImageDraw.Draw(mask).rounded_rectangle(
-        [0, 0, w - 1, w - 1], radius=int(w * 0.22), fill=255)
-    icon.putalpha(mask)
-    ImageDraw.Draw(icon).rounded_rectangle(
-        [0, 0, w - 1, w - 1], radius=int(w * 0.22),
-        outline=(150, 180, 225, 90), width=max(1, w // 256))
-    return icon.resize((S, S), Image.LANCZOS)
 
 
 def _demo(path, w=1200, h=780):

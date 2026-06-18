@@ -226,8 +226,7 @@ def plate_solve(fits_path, *, timeout=300, api_endpoint=None, api_key=None,
     api_key = (api_key if api_key is not None else settings['api_key']).strip()
 
     if not api_key:
-        log_fn('  Plate-solving skipped: no Astrometry.net API key configured')
-        return None
+        log_fn('  No Astrometry.net API key configured; using local API login')
 
     base = os.path.basename(fits_path)
     stem = os.path.splitext(base)[0]

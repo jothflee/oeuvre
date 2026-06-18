@@ -37,6 +37,10 @@ class PipelineConfig:
     stretch_target: float = STRETCH_TARGET
     scnr_amount: float = SCNR_AMOUNT
     star_desat: float = STAR_DESAT
+    # Per-cluster processing handles colour locally (this reproduces the known-
+    # good reference); the global balance pass at the end cleans the background.
+    # The per-channel-only tuning levers below default to off/original and stay
+    # available for manual tuning.
     sat_boost: float = SAT_BOOST
     no_preview: bool = False
     interactive: bool = False
@@ -44,11 +48,16 @@ class PipelineConfig:
     clear_cache: bool = False
     flatten_background: bool = False
     hue_strength: float = 0.40
-    oiii_factor: float = 0.32
+    oiii_factor: float = 0.15  # gentle cyan→blue (higher dips blues to purple)
+    sii_boost: float = 1.0
+    oiii_boost: float = 1.0
+    star_scale: float = 0.70  # star intensity in the screen-blend recombine
+    local_stretch_strength: float = 0.0  # 0=per-panel linked stretch (per-cluster)
     truthful_mode: bool = False
     hubbleize: bool = True
     hubbleize_strength: float = 0.45
     star_consensus: str = 'auto'
+    stack_workers: int = 0  # concurrent (panel,filter) stack jobs; 0 = auto
     log_callback: object = None  # callable(str) for GUI log sink
     preview_object: object = None  # optional TkPreview (or compatible) instance
 
@@ -97,58 +106,89 @@ def glob_result_files(filt_dir):
 
 # ── Preprocessing runner (pure Python) ───────────────────────────────────────
 
+def _stack_worker_count(cfg, n_jobs):
+    """How many (panel,filter) stacks to run concurrently.
+
+    Stacking is memory-heavy (a stack holds all its subs at once), so this is
+    capped well below the CPU-bound default. Override via cfg.stack_workers or
+    the OEUVRE_STACK_WORKERS env var; 0/unset = a conservative auto value.
+    """
+    want = cfg.stack_workers or 0
+    env = os.environ.get('OEUVRE_STACK_WORKERS')
+    if not want and env:
+        try:
+            want = int(env)
+        except ValueError:
+            want = 0
+    if want <= 0:
+        want = max(1, min(4, (os.cpu_count() or 4) // 3))
+    return max(1, min(want, n_jobs))
+
+
 def _run_preprocess(panel_map, out_workspace, cfg):
     """Pure-Python calibrate/register/stack for panels lacking results.
 
-    Mirrors the old Siril runner's contract: for each panel/filter it reads
-    lights/ and darks/ and writes result_<FILTER>_<LIVETIME>s.fit into the
-    filter directory. Master darks are cached per unique dark set within a run.
+    For each panel/filter it reads lights/ and darks/ and writes
+    result_<FILTER>_<LIVETIME>s.fit into the filter directory. Independent
+    (panel,filter) stacks run concurrently (bounded by stack_workers). Master
+    darks are built once per unique dark set up front so the parallel stacks
+    only read the (immutable) cache.
     """
     from . import preprocess
+    from .natural_narrowband import _parallel_map
 
-    dark_cache = {}  # frozenset(dark_paths) -> master dark array
-
+    # ── Gather the (panel,filter) stacks that still need processing ──────
+    jobs = []  # (panel_name, filt_name, filt_dir, lights, darks)
     for panel_name in sorted(panel_map.keys()):
-        filters = panel_map[panel_name]
-        if all(has_results(d) for d in filters.values()):
-            cfg.log(f"\n  {panel_name}: all result files exist — skipping")
-            continue
-
-        cfg.log(f"\n{'=' * 60}")
-        cfg.log(f"  Preprocessing {panel_name}...")
-        cfg.log(f"{'=' * 60}")
-
-        for filt_name, filt_dir in sorted(filters.items()):
+        for filt_name, filt_dir in sorted(panel_map[panel_name].items()):
             if has_results(filt_dir):
-                cfg.log(f"  {filt_name}: result exists — skipping")
+                cfg.log(f"  {panel_name}/{filt_name}: result exists — skipping")
                 continue
-
             lights = _gather_frames(os.path.join(filt_dir, 'lights'))
             darks = _gather_frames(os.path.join(filt_dir, 'darks'))
             if not lights:
-                cfg.log(f"  WARNING: {filt_name}: no lights found — skipping")
+                cfg.log(f"  WARNING: {panel_name}/{filt_name}: no lights — skipping")
                 continue
+            jobs.append((panel_name, filt_name, filt_dir, lights, darks))
 
-            # Reuse a master dark across filters sharing the same dark set.
-            master_dark = None
+    if jobs:
+        # ── Build unique master darks once (serial → safe shared cache) ──
+        dark_cache = {}  # frozenset(realpath darks) -> master dark array
+        for *_, darks in jobs:
             if darks:
                 key = frozenset(os.path.realpath(d) for d in darks)
                 if key not in dark_cache:
                     dark_cache[key] = preprocess.build_master_dark(
                         darks, log=cfg.log)
-                master_dark = dark_cache[key]
 
+        workers = _stack_worker_count(cfg, len(jobs))
+        cfg.log(f"\n  Stacking {len(jobs)} panel/filter job(s) "
+                f"({workers} concurrent)...")
+
+        def _do(job):
+            panel_name, filt_name, filt_dir, lights, darks = job
+            master_dark = None
+            if darks:
+                master_dark = dark_cache[
+                    frozenset(os.path.realpath(d) for d in darks)]
             livetime = preprocess._sum_livetime(lights)
             out_path = os.path.join(
                 filt_dir, f"result_{filt_name}_{livetime}s.fit")
-            cfg.log(f"\n  → {filt_name}  ({len(lights)} lights, "
-                    f"{len(darks)} darks, {livetime}s)")
+            buf = [f"\n  → {panel_name}/{filt_name}  ({len(lights)} lights, "
+                   f"{len(darks)} darks, {livetime}s)"]
             try:
                 preprocess.preprocess_filter(
-                    lights, darks, out_path, log=cfg.log,
+                    lights, darks, out_path, log=buf.append,
                     master_dark=master_dark)
             except Exception as e:
-                cfg.log(f"  ERROR preprocessing {filt_name}: {e}")
+                buf.append(f"  ERROR preprocessing {panel_name}/{filt_name}: {e}")
+            return buf
+
+        # Logs are buffered per job and flushed in order so concurrent stacks
+        # don't interleave into unreadable output.
+        for buf in _parallel_map(_do, jobs, max_workers=workers):
+            for line in buf:
+                cfg.log(line)
 
     # Summary
     cfg.log(f"\n  Preprocessing results:")
@@ -402,6 +442,10 @@ def run_pipeline(cfg: PipelineConfig):
         flatten_background=cfg.flatten_background,
         hue_strength=cfg.hue_strength,
         oiii_factor=cfg.oiii_factor,
+        sii_boost=cfg.sii_boost,
+        oiii_boost=cfg.oiii_boost,
+        star_scale=cfg.star_scale,
+        local_stretch_strength=cfg.local_stretch_strength,
         truthful_mode=cfg.truthful_mode,
         hubbleize=cfg.hubbleize,
         hubbleize_strength=cfg.hubbleize_strength,

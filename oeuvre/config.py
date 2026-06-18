@@ -20,6 +20,8 @@ DEFAULT_SETTINGS_FILE = 'oeuvre_settings.json'
 DEFAULT_SETTINGS = {
     'plate_solve_endpoint': 'https://nova.astrometry.net/api/',
     'plate_solve_api_key': '',
+    'stack_workers': 0,  # concurrent (panel,filter) stack jobs; 0 = auto
+    'starnet_dir': '',   # user-chosen StarNet folder ('' = auto-detect)
 }
 
 
@@ -100,4 +102,35 @@ def save_plate_solve_settings(*, endpoint=None, api_key=None):
         settings['plate_solve_endpoint'] = endpoint
     if api_key is not None:
         settings['plate_solve_api_key'] = api_key
+    return save_settings(settings)
+
+
+def stack_workers_setting():
+    """Concurrent stacking jobs from settings (int; 0 = auto). Robust to junk."""
+    try:
+        return max(0, int(load_settings().get('stack_workers', 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def save_stack_workers_setting(workers):
+    """Update and persist the concurrent-stacking-jobs setting."""
+    settings = load_settings()
+    try:
+        settings['stack_workers'] = max(0, int(workers))
+    except (TypeError, ValueError):
+        settings['stack_workers'] = 0
+    return save_settings(settings)
+
+
+def starnet_dir_setting():
+    """User-chosen StarNet folder from settings ('' = auto-detect)."""
+    val = load_settings().get('starnet_dir', '')
+    return val if isinstance(val, str) else ''
+
+
+def save_starnet_dir_setting(path):
+    """Update and persist the chosen StarNet folder ('' clears the choice)."""
+    settings = load_settings()
+    settings['starnet_dir'] = str(path or '')
     return save_settings(settings)

@@ -63,28 +63,88 @@ def _phasecorr_translation(ref_lin, img_lin, max_shift=200.0):
     return np.float32([[1, 0, -dx], [0, 1, -dy]])
 
 
-def register_frames(frames, log=print, labels=None, ref_idx=None):
+def _reject_low_quality(counts, bgs, labels, log, min_keep_frac=0.6,
+                        min_keep=5, count_frac=0.5, bg_sigma=3.0):
+    """Flag subs that are too poor to help the stack and return kept indices.
+
+    Two cheap, robust signals (both already available from registration):
+      - star count far below the median  → cloud / poor transparency,
+      - background far above the median   → cloud glow / moonlight.
+    Conservative by design: never drops below a keep-floor (the worst are kept
+    if too many are flagged), and logs every rejection with its reason.
+    """
+    n = len(counts)
+    counts = np.asarray(counts, dtype=float)
+    bgs = np.asarray(bgs, dtype=float)
+    cmed = float(np.median(counts))
+    bmed = float(np.median(bgs))
+    bmad = float(np.median(np.abs(bgs - bmed))) * 1.4826 or 1e-9
+
+    low_stars = counts < count_frac * cmed
+    high_bg = bgs > bmed + bg_sigma * bmad
+    bad = low_stars | high_bg
+
+    floor = max(min_keep, int(np.ceil(min_keep_frac * n)))
+    keep = [i for i in range(n) if not bad[i]]
+    if len(keep) < floor:
+        # Too many flagged — keep the best `floor` by a combined quality score.
+        score = counts / (cmed or 1.0) - (bgs - bmed) / bmad
+        keep = sorted(int(i) for i in np.argsort(score)[::-1][:floor])
+
+    keepset = set(keep)
+    for i in range(n):
+        if i in keepset:
+            continue
+        why = []
+        if low_stars[i]:
+            why.append(f"{int(counts[i])} stars (median {int(cmed)})")
+        if high_bg[i]:
+            why.append(f"bg {bgs[i]:.4f} (median {bmed:.4f})")
+        log(f"    REJECT {labels[i]}: {', '.join(why) or 'low quality'}")
+    if len(keep) < n:
+        log(f"  Sub rejection: kept {len(keep)}/{n} "
+            f"(dropped {n - len(keep)} low-quality)")
+    return keep
+
+
+def register_frames(frames, log=print, labels=None, ref_idx=None, reject=True):
     """2-pass registration of 2D linear frames to a common reference, using the
     shared star-centroid + asterism matcher (oeuvre.star_match).
 
-    Pass 1: detect stars in every frame; pick the one with the most as the
-            reference (Siril's reference-selection), unless ref_idx is given
-            (forces that frame — used for SHO channel alignment so Ha stays
-            un-resampled).
+    Pass 1: detect stars in every frame; optionally reject low-quality subs
+            (cloud/poor-transparency: few stars or high background), then pick
+            the frame with the most stars as the reference (unless ref_idx is
+            given). Sub rejection is on for auto-reference stacking only.
     Pass 2: match each frame's asterisms to the reference and warp the LINEAR
             data with Lanczos. Last-resort fallback is phase-correlation
             translation, then unregistered.
 
     Returns (aligned_frames, ref_idx). Pixels outside a warped frame are NaN.
     """
-    from .star_match import detect_stars, match_and_solve
+    from .star_match import build_star_model, solve_from_models
+    from .natural_narrowband import _parallel_map, estimate_background
 
     n = len(frames)
     if labels is None:
         labels = [f"frame{i+1}" for i in range(n)]
 
-    # Pass 1: star counts → reference.
-    counts = [len(detect_stars(fr)[0]) for fr in frames]
+    # Pass 1: detect stars + build asterism models ONCE per frame (parallel).
+    # Reused for both reference selection and every pairwise match below, so the
+    # expensive detection/high-pass runs once per frame rather than per match.
+    models = _parallel_map(build_star_model, frames)
+    counts = [len(m[0]) for m in models]
+
+    # Sub-quality rejection (cloud/transparency) before alignment + stacking.
+    if reject and ref_idx is None and n >= 4:
+        bgs = _parallel_map(lambda fr: estimate_background(fr)[0], frames)
+        keep = _reject_low_quality(counts, bgs, labels, log)
+        if len(keep) < n:
+            frames = [frames[i] for i in keep]
+            models = [models[i] for i in keep]
+            counts = [counts[i] for i in keep]
+            labels = [labels[i] for i in keep]
+            n = len(frames)
+
     if ref_idx is None:
         ref_idx = int(np.argmax(counts))
     h, w = frames[ref_idx].shape[:2]
@@ -92,33 +152,39 @@ def register_frames(frames, log=print, labels=None, ref_idx=None):
         f"({counts[ref_idx]} stars); {n} frames")
 
     ref = frames[ref_idx]
-    aligned = []
-    for i, fr in enumerate(frames):
-        if i == ref_idx:
-            aligned.append(fr.astype(np.float32))
-            continue
+    ref_model = models[ref_idx]
 
-        M, inliers = match_and_solve(fr, ref, log=log)
+    # Pass 2: match each frame to the reference and warp the LINEAR data. Each
+    # frame is independent (matched against the fixed reference model, warped on
+    # its own output buffer), so run the whole pass in a thread pool. Results and
+    # log lines are reassembled in frame order for deterministic output.
+    def _align(i):
+        if i == ref_idx:
+            return frames[i].astype(np.float32), None
+        M, inliers = solve_from_models(models[i], ref_model, log=lambda *a: None)
         method = f"asterism ({inliers} inliers)" if M is not None else None
         if M is None:
-            M = _phasecorr_translation(ref, fr)
+            M = _phasecorr_translation(ref, frames[i])
             if M is not None:
                 method = "phasecorr"
-
         if M is None:
-            log(f"    {labels[i]}: registration FAILED — stacking unregistered")
-            aligned.append(fr.astype(np.float32))
-            continue
-
+            return (frames[i].astype(np.float32),
+                    f"    {labels[i]}: registration FAILED — stacking unregistered")
         warped = cv2.warpAffine(
-            fr.astype(np.float32), M, (w, h),
+            frames[i].astype(np.float32), M, (w, h),
             flags=cv2.INTER_LANCZOS4,
             borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
         ang = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
         sc = float(np.hypot(M[0, 0], M[1, 0]))
-        log(f"    {labels[i]}: {method}  "
-            f"dx={M[0,2]:.1f} dy={M[1,2]:.1f} rot={ang:.3f}° scale={sc:.4f}")
-        aligned.append(warped)
+        return warped, (f"    {labels[i]}: {method}  "
+                        f"dx={M[0,2]:.1f} dy={M[1,2]:.1f} "
+                        f"rot={ang:.3f}° scale={sc:.4f}")
+
+    aligned = []
+    for frame_out, msg in _parallel_map(_align, range(n)):
+        aligned.append(frame_out)
+        if msg:
+            log(msg)
 
     return aligned, ref_idx
 

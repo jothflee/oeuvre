@@ -24,6 +24,21 @@ def test_workspace_default(monkeypatch):
     assert config.workspace() == os.path.expanduser('~/oeuvre-astro')
 
 
+def test_stack_workers_setting_roundtrip(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, 'settings_path',
+                        lambda: str(tmp_path / 'settings.json'))
+    assert config.stack_workers_setting() == 0          # default
+    config.save_stack_workers_setting(3)
+    assert config.stack_workers_setting() == 3
+    config.save_stack_workers_setting(-5)               # clamped to >= 0
+    assert config.stack_workers_setting() == 0
+    # plate-solve settings must survive a stack-workers save (shared file).
+    config.save_plate_solve_settings(endpoint='http://x/api/')
+    config.save_stack_workers_setting(2)
+    assert config.plate_solve_settings()['endpoint'] == 'http://x/api/'
+    assert config.stack_workers_setting() == 2
+
+
 def test_ensure_workspace_creates(monkeypatch, tmp_path):
     ws = tmp_path / 'made'
     monkeypatch.setenv('OEUVRE_WORKSPACE', str(ws))

@@ -44,6 +44,7 @@ import os
 import math
 import argparse
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,43 @@ from .mosaic_prep import read_fits_header
 from .starnet import remove_stars
 
 VERSION = "2.0.0"
+
+
+def _parallel_map(fn, items, max_workers=None):
+    """Order-preserving threaded map for CPU/IO work that releases the GIL.
+
+    The heavy primitives here (cv2 warps/blurs, numpy reductions, FITS reads)
+    release the GIL, so threads give real speedup. Falls back to a serial map
+    for 0/1 items. Workers are capped to keep memory bounded.
+    """
+    items = list(items)
+    if len(items) <= 1:
+        return [fn(x) for x in items]
+    workers = max_workers or min(len(items), (os.cpu_count() or 4))
+    workers = max(1, min(workers, 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(fn, items))
+
+
+def _smooth_lowpass(img, sigma):
+    """Large-sigma Gaussian low-pass, fast.
+
+    The seam-correction field is intentionally very smooth, so a full-res blur
+    with a huge kernel (sigma can be hundreds of px) is wasteful. Downsampling,
+    blurring with a proportionally smaller kernel, and upsampling is visually
+    identical here at a tiny fraction of the cost.
+    """
+    h, w = img.shape[:2]
+    f = max(1, int(sigma // 8))  # downsample factor
+    if f > 1:
+        small = cv2.resize(img, (max(1, w // f), max(1, h // f)),
+                           interpolation=cv2.INTER_AREA)
+        s = max(0.8, sigma / f)
+        k = max(3, int(s * 4) | 1)
+        small = cv2.GaussianBlur(small, (k, k), s)
+        return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    k = max(3, int(sigma * 4) | 1)
+    return cv2.GaussianBlur(img, (k, k), sigma)
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  Constants                                                                 ║
@@ -564,7 +602,7 @@ def arcsinh_stretch(data, beta):
     return (np.arcsinh(beta * data) / denom).astype(np.float32)
 
 
-def linked_stretch_rgb(r, g, b, target_median=0.25, log=print):
+def linked_stretch_rgb(r, g, b, target_median=0.25, shadow_clip=1.5, log=print):
     """Linked arcsinh stretch: compute beta from luminance, apply to all channels.
 
     This is the mathematically correct way to stretch narrowband SHO data:
@@ -587,8 +625,9 @@ def linked_stretch_rgb(r, g, b, target_median=0.25, log=print):
     bg, sigma = estimate_background(L)
     log(f"  Background: {bg:.6f}  sigma: {sigma:.6f}")
 
-    # Black point: clip shadows (PixInsight shadows-clipping = -2.8)
-    black_point = max(bg - 2.8 * sigma, 0.0)
+    # Black point: clip shadows. Lower shadow_clip keeps more faint
+    # extended structure (looks brighter/fuller); higher buries it.
+    black_point = max(bg - shadow_clip * sigma, 0.0)
 
     # Peak: 99.95th percentile (reject hot-pixel outliers)
     valid_L = L[L > 0]
@@ -625,6 +664,59 @@ def linked_stretch_rgb(r, g, b, target_median=0.25, log=print):
     log(f"  Stretched median: {out_median:.4f}  (target: {target_median:.4f})")
 
     return r_s, g_s, b_s
+
+
+def local_adaptive_stretch(r, g, b, target_median=0.18, strength=0.6, grid=14,
+                           clip_lo=0.10, clip_hi=2.5, log=print):
+    """Linked arcsinh stretch with a SMOOTH locally-varying scale.
+
+    A single global stretch sets its white point from the brightest region
+    (the nebula core), so faint outer structure is under-stretched and washes
+    out across a large mosaic. This recovers the per-region local contrast that
+    the old per-cluster pipeline got for free — by dividing, before the stretch,
+    by a smoothly-interpolated *local* brightness field instead of one global
+    scale. `strength` blends local↔global (0 = global, 1 = fully local); the
+    field is heavily smoothed so there are no tile seams. Colour ratios are
+    preserved (the same scale + beta apply to all channels).
+    """
+    if strength <= 0:
+        return linked_stretch_rgb(r, g, b, target_median=target_median, log=log)
+
+    L = (LR * r + LG * g + LB * b).astype(np.float32)
+    bg, sigma = estimate_background(L)
+    bp = max(bg - 2.8 * sigma, 0.0)
+    valid = L[L > 0]
+    gpeak = float(np.percentile(valid, 99.95)) if valid.size else 1.0
+
+    # Per-cell local white level (90th pct of above-floor pixels), bicubic to
+    # full res, then heavily blurred → a seamless local-brightness field.
+    H, W = L.shape
+    chy, cwx = max(1, H // grid), max(1, W // grid)
+    cells = np.full((grid, grid), gpeak, np.float32)
+    for gy in range(grid):
+        for gx in range(grid):
+            cell = L[gy * chy:(gy + 1) * chy, gx * cwx:(gx + 1) * cwx].ravel()
+            v = cell[cell > bp + sigma]
+            if v.size > 50:
+                cells[gy, gx] = float(np.percentile(v, 90))
+    S = cv2.resize(cells, (W, H), interpolation=cv2.INTER_CUBIC)
+    S = cv2.GaussianBlur(S, (0, 0), sigmaX=max(chy, cwx) * 0.6)
+    S = np.clip(S, gpeak * clip_lo, gpeak * clip_hi)
+
+    # Geometric blend of global and local scale, then linked arcsinh.
+    divisor = (gpeak ** (1.0 - strength)) * (S ** strength)
+    scale = np.maximum(divisor - bp, 1e-6)
+    Ln = np.clip((L - bp) / scale, 0, 1)
+    med = float(np.median(Ln[Ln > 0])) if np.any(Ln > 0) else 0.5
+    beta = find_arcsinh_beta(med, target_median)
+    log(f"  Local-adaptive stretch: strength={strength:.2f} grid={grid} "
+        f"beta={beta:.2f}")
+
+    def st(c):
+        return np.clip(arcsinh_stretch(np.clip((c - bp) / scale, 0, None), beta),
+                       0, 1).astype(np.float32)
+
+    return st(r), st(g), st(b)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -781,8 +873,17 @@ def neutralize_background_rgb(r, g, b, sample_fraction=BG_SAMPLE_FRAC, log=print
     log("  Neutralizing background...")
     L = LR * r + LG * g + LB * b
 
-    threshold = float(np.percentile(L, sample_fraction * 100))
-    bg_mask = L < threshold
+    # Sample the darkest fraction of REAL pixels only. On a mosaic the image is
+    # padded with zeros outside the all-channel footprint; including those would
+    # make the "background" sample ≈0 so neutralisation does nothing and a true
+    # sky colour-cast (e.g. an OIII blue halo) survives. Restrict to L>0.
+    real = L > 0.0
+    Lr = L[real]
+    if Lr.size < 100:
+        log("  Warning: too few background pixels, skipping")
+        return r, g, b
+    threshold = float(np.percentile(Lr, sample_fraction * 100))
+    bg_mask = real & (L <= threshold)
     n_bg = int(np.sum(bg_mask))
     if n_bg < 100:
         log("  Warning: too few background pixels, skipping")
@@ -799,6 +900,64 @@ def neutralize_background_rgb(r, g, b, sample_fraction=BG_SAMPLE_FRAC, log=print
     b_n = np.clip(b - bg_b, 0, 1).astype(np.float32)
 
     return r_n, g_n, b_n
+
+
+def background_gradient_neutralize(r, g, b, grid=32, bg_pct=20, neb_pct=60,
+                                   log=print):
+    """Remove a smoothly-varying background colour cast from a finished mosaic.
+
+    When per-cluster panels are mosaicked, each panel carries a slightly
+    different residual sky floor (and seam-equalisation can lift it), so the
+    assembled background develops a soft colour gradient — typically a reddish
+    (SII) cast over part of the frame. A single uniform subtraction
+    (neutralize_background_rgb) can't fix a *spatially-varying* cast, and on a
+    nebula-filled mosaic its "darkest pixels" sample is contaminated by faint
+    signal, so it over-subtracts and turns the image green.
+
+    This estimates a per-channel background *surface* from background pixels
+    only (grid of low-luminance medians, NaN-filled where nebula covers the
+    cell, bicubic + low-pass smoothed), then subtracts it weighted by a
+    luminance taper so the bright nebula keeps its colour. Subtracting the
+    smooth surface from faint nebula is correct — it removes the pedestal the
+    nebula sits on — so the gold/teal stay intact while the sky goes neutral.
+    """
+    log("  Background gradient neutralize (nebula-safe)...")
+    L = (LR * r + LG * g + LB * b).astype(np.float32)
+    real = L > 0.0
+    if int(np.sum(real)) < 1000:
+        log("  Warning: too few real pixels, skipping")
+        return r, g, b
+    Lr = L[real]
+    lo = float(np.percentile(Lr, bg_pct))
+    hi = float(np.percentile(Lr, neb_pct))
+    bg_mask = real & (L <= lo)
+    h, w = L.shape
+    ys = np.linspace(0, h, grid + 1).astype(int)
+    xs = np.linspace(0, w, grid + 1).astype(int)
+
+    def surface(ch):
+        cell = np.full((grid, grid), np.nan, dtype=np.float32)
+        for iy in range(grid):
+            for ix in range(grid):
+                m = bg_mask[ys[iy]:ys[iy + 1], xs[ix]:xs[ix + 1]]
+                if int(m.sum()) > 30:
+                    cell[iy, ix] = np.median(
+                        ch[ys[iy]:ys[iy + 1], xs[ix]:xs[ix + 1]][m])
+        # Nebula-covered cells (no background) → global background median.
+        gmed = float(np.nanmedian(cell)) if np.isfinite(cell).any() else 0.0
+        cell[~np.isfinite(cell)] = gmed
+        up = cv2.resize(cell, (w, h), interpolation=cv2.INTER_CUBIC)
+        return _smooth_lowpass(up, sigma=max(h, w) / 12.0)
+
+    sr, sg, sb = _parallel_map(surface, [r, g, b])
+    log(f"  Background surface medians: R={float(np.median(sr[bg_mask])):.4f} "
+        f"G={float(np.median(sg[bg_mask])):.4f} "
+        f"B={float(np.median(sb[bg_mask])):.4f}")
+    # Taper: full subtraction in background (L≤lo), none in nebula (L≥hi).
+    wt = (np.clip((hi - L) / (hi - lo + 1e-6), 0, 1) * real).astype(np.float32)
+    return (np.clip(r - sr * wt, 0, 1).astype(np.float32),
+            np.clip(g - sg * wt, 0, 1).astype(np.float32),
+            np.clip(b - sb * wt, 0, 1).astype(np.float32))
 
 
 def boost_saturation(r, g, b, factor=1.25, signal_floor=0.03, log=print):
@@ -1088,52 +1247,6 @@ def tame_blue_stars_pre_starnet(r, g, b, strength=0.85, log=print):
             np.clip(b_out, 0, 1).astype(np.float32))
 
 
-def _alignment_plane(data):
-    """Build a star-emphasized plane for translation estimation."""
-    x = np.asarray(data, dtype=np.float32)
-    blur = cv2.GaussianBlur(x, (0, 0), sigmaX=2.0, sigmaY=2.0)
-    hp = np.clip(x - blur, 0, None)
-    p = float(np.percentile(hp, 99.5)) if np.any(hp > 0) else 0.0
-    if p > 0:
-        hp = hp / p
-    return np.clip(hp, 0, 1).astype(np.float32)
-
-
-def refine_channel_translation(ref_ha, moving, label, log=print,
-                               min_shift_px=0.25, max_shift_px=20.0):
-    """Refine residual translational misalignment of a channel to Ha.
-
-    Uses phase correlation on star-emphasized planes, then applies the
-    inverse shift to the moving channel when the shift is plausible.
-    """
-    ref = _alignment_plane(ref_ha)
-    mov = _alignment_plane(moving)
-
-    (dx, dy), response = cv2.phaseCorrelate(ref, mov)
-    shift_mag = float(np.hypot(dx, dy))
-
-    if response < 0.02:
-        log(f"  Alignment refine ({label}): low confidence (resp={response:.3f}), skipped")
-        return moving
-    if shift_mag < min_shift_px:
-        return moving
-    if shift_mag > max_shift_px:
-        log(f"  Alignment refine ({label}): shift {shift_mag:.2f}px too large, skipped")
-        return moving
-
-    M = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
-    h, w = moving.shape[:2]
-    corrected = cv2.warpAffine(
-        moving.astype(np.float32), M, (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
-    log(f"  Alignment refine ({label}): applied dX={-dx:.2f}px dY={-dy:.2f}px "
-        f"(raw {dx:.2f},{dy:.2f}, resp={response:.3f})")
-    return corrected.astype(np.float32)
-
-
 def apply_star_channel_consensus(r, g, b, mode='soft', log=print):
     """Suppress stars not supported across channels.
 
@@ -1296,37 +1409,74 @@ def compute_mosaic_geometry(panel_images, log=print):
             'feather_border': max(50, int(np.sqrt(h_ref**2 + w_ref**2)) // 5),
         }
 
-    # Match each panel to the reference with the shared asterism matcher
-    # (oeuvre.star_match) — the same star-geometry registration used for sub
-    # stacking and SHO channel alignment.
-    from .star_match import detect_stars, match_and_solve
+    # Register panels with the shared asterism matcher (oeuvre.star_match) — the
+    # same star-geometry registration used for sub stacking and SHO channel
+    # alignment. Two robustness properties matter for "use all the data":
+    #   1. Detection is nebula-robust (high-pass prefilter in detect_stars), so
+    #      nebula-heavy panels still expose enough real stars to match.
+    #   2. Each panel is matched against *any already-placed panel*, not just a
+    #      single fixed reference. A strip/grid mosaic chains together (panel A
+    #      may only overlap panel B, which overlaps the anchor) instead of
+    #      dropping panels that simply don't touch panel 0.
+    from .star_match import build_star_model
 
-    log(f"  Reference panel: {ref.shape[1]}x{ref.shape[0]}, "
-        f"{len(detect_stars(ref)[0])} stars detected")
+    # Detect plenty of stars per panel: with only weak (~40%) overlap, each
+    # panel's brightest few-hundred stars sit mostly OUTSIDE the shared strip,
+    # so a low cap leaves too few common stars to match. A high cap keeps enough
+    # stars in the overlap region for weak-overlap panels to register.
+    MOSAIC_MAX_STARS = 800
 
-    transforms = [identity_2x3.copy()]  # identity for reference
+    # Detect stars + build asterism invariants ONCE per panel. The incremental
+    # placement below does up to O(n²) pairwise matches; rebuilding star models
+    # (which run the high-pass blur + detection) inside that loop would be
+    # prohibitively slow on full-res panels, so we precompute and reuse them.
+    models = _parallel_map(
+        lambda p: build_star_model(p, max_stars=MOSAIC_MAX_STARS), panel_images)
+    star_counts = [len(m[0]) for m in models]
 
-    for i in range(1, n):
-        M, inliers = match_and_solve(panel_images[i], ref, log=log)
-        if M is None:
-            log(f"  WARNING: panel {i+1} failed asterism match "
-                f"(insufficient star overlap). Dropping from mosaic.")
-            transforms.append(None)  # mark as failed
-            continue
+    # Anchor = the panel exposing the most stars (most reliable to match against).
+    anchor = int(np.argmax(star_counts))
+    log(f"  Anchor panel: {anchor+1} "
+        f"({panel_images[anchor].shape[1]}x{panel_images[anchor].shape[0]}, "
+        f"{star_counts[anchor]} stars); per-panel stars={star_counts}")
 
-        sx = np.hypot(M[0, 0], M[1, 0])
-        angle_deg = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
-        tx, ty = M[0, 2], M[1, 2]
-        log(f"  Panel {i+1}: asterism match, {inliers} inliers  "
-            f"dx={tx:.1f}px dy={ty:.1f}px rot={angle_deg:.3f}° scale={sx:.4f}")
-        transforms.append(M)
+    transforms = [None] * n            # panel coords -> anchor coords (2x3) or None
+    transforms[anchor] = identity_2x3.copy()
+    placed = {anchor}
 
-    # ── Filter out failed panels ─────────────────────────────────────────
+    # Iterate until no further panel can be attached (handles A->B->anchor chains).
+    progress = True
+    while progress and len(placed) < n:
+        progress = False
+        for i in range(n):
+            if i in placed:
+                continue
+            best = None  # (inliers, M, j)
+            for j in list(placed):
+                # Bidirectional: the matcher is asymmetric under weak overlap,
+                # so a pair can solve (placed → unplaced) even when the
+                # (unplaced → placed) query fails. Try both, invert as needed.
+                M, inliers = _solve_models_either(models[i], models[j], log=log)
+                if M is not None and (best is None or inliers > best[0]):
+                    best = (inliers, M, j)
+            if best is None:
+                continue
+            inliers, M, j = best
+            transforms[i] = _compose_affine(transforms[j], M)
+            placed.add(i)
+            progress = True
+            sx = np.hypot(M[0, 0], M[1, 0])
+            angle_deg = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+            log(f"  Panel {i+1}: matched to panel {j+1}, {inliers} inliers  "
+                f"dx={M[0, 2]:.1f}px dy={M[1, 2]:.1f}px "
+                f"rot={angle_deg:.3f}° scale={sx:.4f}")
+
+    # ── Filter out panels that couldn't be attached to anything ───────────
     kept_indices = [i for i, M in enumerate(transforms) if M is not None]
-    if len(kept_indices) < len(transforms):
+    if len(kept_indices) < n:
         dropped = [i + 1 for i, M in enumerate(transforms) if M is None]
-        log(f"  Dropped panel(s) {dropped} from mosaic "
-            f"(insufficient overlap)")
+        log(f"  WARNING: panel(s) {dropped} could not be matched to any other "
+            f"panel (insufficient star overlap). Dropping from mosaic.")
     transforms = [transforms[i] for i in kept_indices]
     panel_images = [panel_images[i] for i in kept_indices]
 
@@ -1398,6 +1548,39 @@ def _compose_affine(A, B):
     B3 = np.vstack([B, [0, 0, 1]])
     C3 = A3 @ B3
     return C3[:2, :].copy()
+
+
+def _invert_affine(M):
+    """Invert a 2×3 affine matrix. M maps a→b; result maps b→a."""
+    M3 = np.vstack([M, [0, 0, 1]])
+    return np.linalg.inv(M3)[:2, :].copy()
+
+
+def _solve_models_either(model_i, model_j, log=print):
+    """Solve the i→j affine, robust to the matcher's directional asymmetry.
+
+    star_match.solve_from_models is not symmetric: with weak overlap it
+    frequently solves one direction (e.g. P1→P4) but returns None for the
+    reverse (P4→P1), because the triangle-hash query uses the source panel's
+    asterisms. The mosaic placement loop always queries (unplaced → placed),
+    so a perfectly good pair can be dropped purely because that *direction*
+    failed. Try the reverse and invert when the forward solve fails, keeping
+    whichever yields more inliers.
+
+    Returns (M_i_to_j, inliers) or (None, 0).
+    """
+    from .star_match import solve_from_models
+    M_fwd, inl_fwd = solve_from_models(model_i, model_j, log=log)
+    M_rev, inl_rev = solve_from_models(model_j, model_i, log=log)
+    cand = []
+    if M_fwd is not None:
+        cand.append((inl_fwd, M_fwd))
+    if M_rev is not None:
+        cand.append((inl_rev, _invert_affine(M_rev)))
+    if not cand:
+        return None, 0
+    inliers, M = max(cand, key=lambda c: c[0])
+    return M, inliers
 
 
 def apply_mosaic_rgb(panel_images, geometry, log=print):
@@ -1511,9 +1694,11 @@ def apply_mosaic_rgb(panel_images, geometry, log=print):
                 diff_weight[po] = 1.0
 
                 # Smooth both numerator and denominator → normalized smooth diff
-                # This extrapolates the correction beyond the overlap zone
-                smooth_num = cv2.GaussianBlur(diff_map, (ksize, ksize), sigma)
-                smooth_den = cv2.GaussianBlur(diff_weight, (ksize, ksize), sigma)
+                # This extrapolates the correction beyond the overlap zone.
+                # _smooth_lowpass (downscale→blur→upscale) is ~the same result
+                # as a huge-kernel GaussianBlur but far faster on big mosaics.
+                smooth_num = _smooth_lowpass(diff_map, sigma)
+                smooth_den = _smooth_lowpass(diff_weight, sigma)
                 smooth_den = np.maximum(smooth_den, 1e-6)
                 correction = smooth_num / smooth_den
 
@@ -1564,47 +1749,40 @@ def apply_mosaic_rgb(panel_images, geometry, log=print):
     return result
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Channel Alignment (pure cv2)                                                           ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+def refine_channel_translation(ref_ha, moving, label, log=print,
+                               min_shift_px=0.25, max_shift_px=20.0):
+    """Refine residual translational misalignment of a channel to Ha.
 
-def align_channels(sii_path, ha_path, oiii_path, work_dir, log=print):
-    """Align SHO channels with pure-cv2 2-pass registration (Ha = reference).
-
-    Replaces the former Siril 2-pass + COG step. Ha is forced as the reference
-    so it is never resampled; SII and OIII are warped onto it. Residual
-    sub-pixel translation is polished afterward by refine_channel_translation
-    in the caller. Returns (sii_aligned, ha_aligned, oiii_aligned) as 2D float32.
+    Uses phase correlation on star-emphasized planes, then applies the
+    inverse shift to the moving channel when the shift is plausible.
     """
-    from .preprocess import register_frames
+    ref = _alignment_plane(ref_ha)
+    mov = _alignment_plane(moving)
 
-    def mono(a):
-        return a if a.ndim == 2 else a[0]
+    (dx, dy), response = cv2.phaseCorrelate(ref, mov)
+    shift_mag = float(np.hypot(dx, dy))
 
-    ha = mono(load_fits(ha_path)[0].astype(np.float32))
-    sii = mono(load_fits(sii_path)[0].astype(np.float32))
-    oiii = mono(load_fits(oiii_path)[0].astype(np.float32))
+    if response < 0.02:
+        log(f"  Alignment refine ({label}): low confidence (resp={response:.3f}), skipped")
+        return moving
+    if shift_mag < min_shift_px:
+        return moving
+    if shift_mag > max_shift_px:
+        log(f"  Alignment refine ({label}): shift {shift_mag:.2f}px too large, skipped")
+        return moving
 
-    # Order [Ha, SII, OIII] and force Ha (index 0) as the reference.
-    aligned, _ = register_frames(
-        [ha, sii, oiii], log=log,
-        labels=['Ha (ref)', 'SII', 'OIII'], ref_idx=0)
-    ha_a, sii_a, oiii_a = aligned
+    M = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
+    h, w = moving.shape[:2]
+    corrected = cv2.warpAffine(
+        moving.astype(np.float32), M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    log(f"  Alignment refine ({label}): applied dX={-dx:.2f}px dY={-dy:.2f}px "
+        f"(raw {dx:.2f},{dy:.2f}, resp={response:.3f})")
+    return corrected.astype(np.float32)
 
-    # Out-of-frame pixels from warping are NaN; zero them for downstream math.
-    sii_a = np.nan_to_num(sii_a, nan=0.0).astype(np.float32)
-    oiii_a = np.nan_to_num(oiii_a, nan=0.0).astype(np.float32)
-    ha_a = ha_a.astype(np.float32)
-
-    for name, data in [("Ha (ref)", ha_a), ("SII", sii_a), ("OIII", oiii_a)]:
-        log(f"    {name:10s}: shape={data.shape}  "
-            f"range=[{np.min(data):.6f}, {np.max(data):.6f}]")
-    return sii_a, ha_a, oiii_a
-
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Channel Normalization                                                     ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def normalize_channels(sii, ha, oiii, log=print):
     """Normalize SHO channels for palette combination.
@@ -1654,9 +1832,50 @@ def normalize_channels(sii, ha, oiii, log=print):
     return normalized['SII'], normalized['Ha'], normalized['OIII']
 
 
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  Pipeline                                                                  ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
+def _alignment_plane(data):
+    """Build a star-emphasized plane for translation estimation."""
+    x = np.asarray(data, dtype=np.float32)
+    blur = cv2.GaussianBlur(x, (0, 0), sigmaX=2.0, sigmaY=2.0)
+    hp = np.clip(x - blur, 0, None)
+    p = float(np.percentile(hp, 99.5)) if np.any(hp > 0) else 0.0
+    if p > 0:
+        hp = hp / p
+    return np.clip(hp, 0, 1).astype(np.float32)
+
+
+def align_channels(sii_path, ha_path, oiii_path, work_dir, log=print):
+    """Align SHO channels with pure-cv2 2-pass registration (Ha = reference).
+
+    Replaces the former Siril 2-pass + COG step. Ha is forced as the reference
+    so it is never resampled; SII and OIII are warped onto it. Residual
+    sub-pixel translation is polished afterward by refine_channel_translation
+    in the caller. Returns (sii_aligned, ha_aligned, oiii_aligned) as 2D float32.
+    """
+    from .preprocess import register_frames
+
+    def mono(a):
+        return a if a.ndim == 2 else a[0]
+
+    ha = mono(load_fits(ha_path)[0].astype(np.float32))
+    sii = mono(load_fits(sii_path)[0].astype(np.float32))
+    oiii = mono(load_fits(oiii_path)[0].astype(np.float32))
+
+    # Order [Ha, SII, OIII] and force Ha (index 0) as the reference.
+    aligned, _ = register_frames(
+        [ha, sii, oiii], log=log,
+        labels=['Ha (ref)', 'SII', 'OIII'], ref_idx=0)
+    ha_a, sii_a, oiii_a = aligned
+
+    # Out-of-frame pixels from warping are NaN; zero them for downstream math.
+    sii_a = np.nan_to_num(sii_a, nan=0.0).astype(np.float32)
+    oiii_a = np.nan_to_num(oiii_a, nan=0.0).astype(np.float32)
+    ha_a = ha_a.astype(np.float32)
+
+    for name, data in [("Ha (ref)", ha_a), ("SII", sii_a), ("OIII", oiii_a)]:
+        log(f"    {name:10s}: shape={data.shape}  "
+            f"range=[{np.min(data):.6f}, {np.max(data):.6f}]")
+    return sii_a, ha_a, oiii_a
+
 
 class SHOPipeline:
     """Professional SHO Hubble Palette processing pipeline.
@@ -1673,6 +1892,8 @@ class SHOPipeline:
                  hue_strength=0.40, oiii_factor=0.32,
                  truthful_mode=False,
                  hubbleize=True, hubbleize_strength=0.45,
+                 sii_boost=1.0, oiii_boost=1.0, star_scale=0.70,
+                 local_stretch_strength=0.0,
                  star_consensus='auto'):
 
         # Always work with lists of paths (mosaic is the default mode)
@@ -1700,6 +1921,10 @@ class SHOPipeline:
         self.flatten_background  = flatten_background
         self.hue_strength        = hue_strength
         self.oiii_factor    = oiii_factor
+        self.sii_boost      = float(sii_boost)
+        self.oiii_boost     = float(oiii_boost)
+        self.star_scale     = float(star_scale)
+        self.local_stretch_strength = float(local_stretch_strength)
         self.truthful_mode  = bool(truthful_mode)
         self.hubbleize = bool(hubbleize)
         self.hubbleize_strength = float(hubbleize_strength)
@@ -1745,30 +1970,40 @@ class SHOPipeline:
         self.log(f"  [debug] starless: {starless_png}")
         self.log(f"  [debug] stars:    {stars_png}")
 
-    def _crop_to_full_coverage(self, rgb):
-        """Crop to the bounding box where all 3 channels have valid data.
+    def _crop_to_full_coverage(self, rgb, coverage=None):
+        """Crop to where all 3 channels have data, blacking out the rest.
 
-        When a filter (e.g. SII) is borrowed from a different pointing,
-        some edge pixels may have only 1 or 2 channels populated.  This
-        crops the final image to the largest rectangle where every pixel
-        has all 3 channels above a small threshold.
+        `coverage` (bool [H, W]) is the authoritative all-3-channel mask taken
+        from the mosaic warp — preferred, because after colour processing a
+        covered pixel can still be near-zero (and vice-versa). Pixels outside it
+        are zeroed and the image is cropped to its bounding box, so partial tiles
+        keep only the area where every channel is present. Without a mask,
+        coverage is inferred from the RGB values (legacy single-image path).
         """
-        threshold = 0.002  # ignore feathered near-zero edges
-        valid = np.all(rgb > threshold, axis=2)  # [H, W] bool
+        if coverage is None:
+            threshold = 0.002  # ignore feathered near-zero edges
+            coverage = np.all(rgb > threshold, axis=2)  # [H, W] bool
+        elif coverage.shape != rgb.shape[:2]:
+            # Defensive: StarNet normally preserves dims, but if it cropped,
+            # align the mask to the (possibly smaller) processed image.
+            h = min(coverage.shape[0], rgb.shape[0])
+            w = min(coverage.shape[1], rgb.shape[1])
+            coverage = coverage[:h, :w]
+            rgb = rgb[:h, :w]
 
-        if np.all(valid):
+        if not np.any(coverage):
+            self.log("  WARNING: No pixels with full 3-channel coverage!")
+            return rgb
+        if np.all(coverage):
             self.log("  All pixels have full 3-channel coverage — no crop needed")
             return rgb
 
-        # Check how much data is missing coverage
-        n_valid = int(np.count_nonzero(valid))
-        if n_valid == 0:
-            self.log("  WARNING: No pixels with full 3-channel coverage!")
-            return rgb
+        # Black out anything lacking all-3 coverage so partial edges don't show.
+        rgb = rgb.copy()
+        rgb[~coverage] = 0.0
 
-        # Find bounding box of valid region
-        rows = np.any(valid, axis=1)
-        cols = np.any(valid, axis=0)
+        rows = np.any(coverage, axis=1)
+        cols = np.any(coverage, axis=0)
         r_min, r_max = np.where(rows)[0][[0, -1]]
         c_min, c_max = np.where(cols)[0][[0, -1]]
 
@@ -1785,41 +2020,45 @@ class SHOPipeline:
         return cropped
 
     def run(self):
-        """Execute the full SHO pipeline.
+        """Execute the full SHO pipeline (hybrid).
 
-        Multi-panel strategy: process each panel through the full SHO
-        pipeline independently (align → normalize → stretch → star remove
-        → SCNR → color balance → star recombine), then find SIFT
-        geometry from the processed RGB luminance and mosaic the
-        finished panels together.  This produces the best SIFT matches
-        (high-contrast processed images) and seamless mosaics.
+        Per-cluster processing for STRUCTURE: each complete pointing is aligned
+        and run through the full SHO pipeline independently — its stretch adapts
+        to that region, drawing out local detail — then the finished RGB panels
+        are mosaicked (feather + seam-equalised). A final GLOBAL BALANCE pass
+        cleans the assembled mosaic (background gradient flatten + zero-aware
+        neutralise + gentle colour/saturation unify) — the clean-background
+        benefit of the per-channel approach, applied once at the end.
         """
         self._banner()
         t0 = time.time()
         try:
-            panels = self._step_load()
-            sii_panels, ha_panels, oiii_panels = panels
-            n_panels = min(len(sii_panels), len(ha_panels), len(oiii_panels))
-            if n_panels < max(len(sii_panels), len(ha_panels), len(oiii_panels)):
-                self.log(f"  WARNING: Panel counts differ "
-                         f"(SII={len(sii_panels)}, Ha={len(ha_panels)}, "
-                         f"OIII={len(oiii_panels)}), using {n_panels}")
-                sii_panels = sii_panels[:n_panels]
-                ha_panels = ha_panels[:n_panels]
-                oiii_panels = oiii_panels[:n_panels]
-            self.preview.init_grid(n_panels)
+            sii_panels = _parallel_map(self._load_mono, self.sii_paths)
+            ha_panels = _parallel_map(self._load_mono, self.ha_paths)
+            oiii_panels = _parallel_map(self._load_mono, self.oiii_paths)
+            n = min(len(sii_panels), len(ha_panels), len(oiii_panels))
+            self.preview.init_grid(n)
 
-            if n_panels == 1:
-                # ── Single panel: straightforward pipeline ──────────────
-                sii, ha, oiii = sii_panels[0], ha_panels[0], oiii_panels[0]
-                sii, ha, oiii = self._step_align(sii, ha, oiii)
+            self._single_panel = (n == 1)
+            if n == 1:
+                sii, ha, oiii = self._step_align(
+                    sii_panels[0], ha_panels[0], oiii_panels[0])
                 final = self._process_sho(sii, ha, oiii, panel_idx=0)
             else:
-                # ── Multi-panel: per-panel SHO, then mosaic RGB ─────────
                 final = self._step_mosaic_processed(
-                    sii_panels, ha_panels, oiii_panels)
+                    sii_panels[:n], ha_panels[:n], oiii_panels[:n])
 
-            output_path = self._step_save(self._crop_to_full_coverage(final))
+            # Full global balance (gradient flatten + uniform neutralize) is
+            # disabled — it crushed the gold (0.25→0.12) and over-blued the
+            # result. Instead, a gentle nebula-safe background gradient
+            # neutralize removes the soft red sky cast that builds up when
+            # per-cluster panels are mosaicked, while leaving the nebula colour
+            # untouched. Single-panel runs have no inter-panel cast, so skip it.
+            if not getattr(self, '_single_panel', False):
+                final = self._step_background_neutralize(final)
+            final = self._crop_to_full_coverage(final)
+
+            output_path = self._step_save(final)
             elapsed = time.time() - t0
             self._finish(output_path, elapsed)
             return output_path
@@ -1828,6 +2067,71 @@ class SHOPipeline:
             import traceback
             traceback.print_exc()
             raise
+
+    def _step_background_neutralize(self, final_rgb):
+        """Remove the soft inter-panel background colour gradient (mosaic only).
+
+        A targeted, nebula-safe replacement for the old global balance: it
+        neutralises only the smoothly-varying sky cast that appears once
+        per-cluster panels are mosaicked, and leaves the nebula colour alone.
+        """
+        self.log("\n" + "=" * 70)
+        self.log("  STEP: Background gradient neutralize (mosaic seam cast)")
+        self.log("=" * 70)
+        r, g, b = (final_rgb[:, :, 0], final_rgb[:, :, 1], final_rgb[:, :, 2])
+        r, g, b = background_gradient_neutralize(r, g, b, log=self.log)
+        return np.clip(np.stack([r, g, b], axis=-1), 0, 1).astype(np.float32)
+
+    def _load_mono(self, path):
+        """Load a 2D float32 master from a (mono or [3,H,W]) FITS path."""
+        data, _ = load_fits(path)
+        return (data if data.ndim == 2 else data[0]).astype(np.float32)
+
+    def _cache_path(self, filename):
+        """Get path inside the current work dir's cache directory."""
+        cache_dir = os.path.join(self.work_dir, 'cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, filename)
+
+    def _cache_exists(self, *filenames):
+        """Check if all named cache files exist."""
+        return all(os.path.isfile(self._cache_path(f)) for f in filenames)
+
+    def _cache_save_rgb(self, name, rgb_hwc):
+        """Save [H,W,3] float32 RGB to cache as [3,H,W] FITS + PNG preview."""
+        path = self._cache_path(name)
+        save_fits(np.transpose(rgb_hwc, (2, 0, 1)), path)
+        # PNG preview (RGB already stretched to [0,1])
+        png_path = os.path.splitext(path)[0] + '.png'
+        img8 = np.clip(rgb_hwc * 255, 0, 255).astype(np.uint8)
+        cv2.imwrite(png_path, img8[:, :, ::-1])  # RGB → BGR for cv2
+        return path
+
+    def _cache_load_rgb(self, name):
+        """Load [3,H,W] FITS from cache, return as [H,W,3] float32."""
+        path = self._cache_path(name)
+        data, _ = load_fits(path)
+        if len(data.shape) == 3 and data.shape[0] == 3:
+            return np.transpose(data, (1, 2, 0))
+        return data
+
+    def _cache_save_mono(self, name, data_2d):
+        """Save 2D float32 array to cache + PNG preview."""
+        path = self._cache_path(name)
+        save_fits(data_2d, path)
+        # PNG preview (gamma-stretch linear data for visibility)
+        png_path = os.path.splitext(path)[0] + '.png'
+        stretched = preview_stretch_mono(data_2d)
+        img8 = np.clip(stretched * 255, 0, 255).astype(np.uint8)
+        cv2.imwrite(png_path, img8)
+
+    def _cache_load_mono(self, name):
+        """Load 2D float32 array from cache."""
+        data, _ = load_fits(self._cache_path(name))
+        return data
+
+
+    # ── Core SHO processing ─────────────────────────────────────────────
 
     def _step_mosaic_processed(self, sii_panels, ha_panels, oiii_panels):
         """Process each panel through full SHO, then SIFT-mosaic the results.
@@ -1904,60 +2208,70 @@ class SHOPipeline:
 
         return final
 
-    # ── Caching ─────────────────────────────────────────────────────────
-    # All intermediate outputs are cached in _sho_work/_panel_N/cache/.
-    # Delete specific files to re-run from that point:
-    #   panel_rgb.fit  → re-runs SCNR + color + stars + recombine (~5s)
-    #   starless.fit   → re-runs from StarNet onwards (~60s)
-    #   aligned_*.fit  → re-runs from alignment onwards (~120s)
-    #   entire cache/  → full re-run
+    def _step_align(self, sii, ha, oiii):
+        self.step = 2
+        self.log("\n" + "=" * 70)
+        self.log("  STEP 2: Channel Alignment (cv2 2-Pass, Ha reference)")
+        self.log("=" * 70)
 
-    def _cache_path(self, filename):
-        """Get path inside the current work dir's cache directory."""
-        cache_dir = os.path.join(self.work_dir, 'cache')
-        os.makedirs(cache_dir, exist_ok=True)
-        return os.path.join(cache_dir, filename)
+        # Check cache first
+        if self._cache_exists('aligned_sii.fit', 'aligned_ha.fit',
+                              'aligned_oiii.fit'):
+            self.log("  [CACHE] Aligned channels found, loading from cache")
+            sii_a = self._cache_load_mono('aligned_sii.fit')
+            ha_a = self._cache_load_mono('aligned_ha.fit')
+            oiii_a = self._cache_load_mono('aligned_oiii.fit')
 
-    def _cache_exists(self, *filenames):
-        """Check if all named cache files exist."""
-        return all(os.path.isfile(self._cache_path(f)) for f in filenames)
+            # Even cached alignments can become stale/noisy with changing
+            # input selections; refine residual translation each run.
+            sii_a = refine_channel_translation(ha_a, sii_a, 'SII', log=self.log)
+            oiii_a = refine_channel_translation(ha_a, oiii_a, 'OIII', log=self.log)
 
-    def _cache_save_rgb(self, name, rgb_hwc):
-        """Save [H,W,3] float32 RGB to cache as [3,H,W] FITS + PNG preview."""
-        path = self._cache_path(name)
-        save_fits(np.transpose(rgb_hwc, (2, 0, 1)), path)
-        # PNG preview (RGB already stretched to [0,1])
-        png_path = os.path.splitext(path)[0] + '.png'
-        img8 = np.clip(rgb_hwc * 255, 0, 255).astype(np.uint8)
-        cv2.imwrite(png_path, img8[:, :, ::-1])  # RGB → BGR for cv2
-        return path
+            for name, data in [("Ha (ref)", ha_a),
+                               ("SII", sii_a), ("OIII", oiii_a)]:
+                self.log(f"    {name:10s}: shape={data.shape}  "
+                         f"range=[{np.min(data):.6f}, {np.max(data):.6f}]")
 
-    def _cache_load_rgb(self, name):
-        """Load [3,H,W] FITS from cache, return as [H,W,3] float32."""
-        path = self._cache_path(name)
-        data, _ = load_fits(path)
-        if len(data.shape) == 3 and data.shape[0] == 3:
-            return np.transpose(data, (1, 2, 0))
-        return data
+            self._cache_save_mono('aligned_sii.fit', sii_a)
+            self._cache_save_mono('aligned_oiii.fit', oiii_a)
+            return sii_a, ha_a, oiii_a
 
-    def _cache_save_mono(self, name, data_2d):
-        """Save 2D float32 array to cache + PNG preview."""
-        path = self._cache_path(name)
-        save_fits(data_2d, path)
-        # PNG preview (gamma-stretch linear data for visibility)
-        png_path = os.path.splitext(path)[0] + '.png'
-        stretched = preview_stretch_mono(data_2d)
-        img8 = np.clip(stretched * 255, 0, 255).astype(np.uint8)
-        cv2.imwrite(png_path, img8)
+        self.log("  Method: cv2 2-pass star registration (asterism + similarity)")
+        self.log("  Reference: Ha (kept un-resampled)")
 
-    def _cache_load_mono(self, name):
-        """Load 2D float32 array from cache."""
-        data, _ = load_fits(self._cache_path(name))
-        return data
+        # Write channels to temp FITS so align_channels reads via load_fits.
+        align_sii  = os.path.join(self.work_dir, '_align_sii.fit')
+        align_ha   = os.path.join(self.work_dir, '_align_ha.fit')
+        align_oiii = os.path.join(self.work_dir, '_align_oiii.fit')
+        save_fits(sii, align_sii)
+        save_fits(ha, align_ha)
+        save_fits(oiii, align_oiii)
 
+        sii_a, ha_a, oiii_a = align_channels(
+            align_sii, align_ha, align_oiii,
+            self.work_dir, log=self.log)
 
+        # Refine residual per-channel translation to Ha reference.
+        sii_a = refine_channel_translation(ha_a, sii_a, 'SII', log=self.log)
+        oiii_a = refine_channel_translation(ha_a, oiii_a, 'OIII', log=self.log)
 
-    # ── Core SHO processing ─────────────────────────────────────────────
+        # Ensure matching shapes after alignment
+        shapes = [sii_a.shape, ha_a.shape, oiii_a.shape]
+        if len(set(shapes)) > 1:
+            self.log("  Post-alignment shape mismatch, cropping to common size")
+            min_h = min(s[-2] for s in shapes)
+            min_w = min(s[-1] for s in shapes)
+            sii_a = sii_a[..., :min_h, :min_w]
+            ha_a = ha_a[..., :min_h, :min_w]
+            oiii_a = oiii_a[..., :min_h, :min_w]
+
+        # Save to cache
+        self._cache_save_mono('aligned_sii.fit', sii_a)
+        self._cache_save_mono('aligned_ha.fit', ha_a)
+        self._cache_save_mono('aligned_oiii.fit', oiii_a)
+        self.log("  [CACHE] Saved aligned channels to cache")
+
+        return sii_a, ha_a, oiii_a
 
     def _process_sho(self, sii, ha, oiii, panel_idx=0):
         """Run the full SHO colour pipeline on aligned channels.
@@ -2041,97 +2355,9 @@ class SHOPipeline:
 
     # ── Step 1: Load ────────────────────────────────────────────────────────
 
-    def _step_load(self):
-        self.step = 1
-        self.log("\n" + "=" * 70)
-        self.log("  STEP 1: Load Input Panels")
-        self.log("=" * 70)
-
-        sii_panels, ha_panels, oiii_panels = [], [], []
-
-        for ch_name, paths, panels in [
-                ("SII",  self.sii_paths,  sii_panels),
-                ("Ha",   self.ha_paths,   ha_panels),
-                ("OIII", self.oiii_paths, oiii_panels)]:
-            self.log(f"\n  {ch_name}: {len(paths)} panel(s)")
-            for i, p in enumerate(paths):
-                data, _ = load_fits(p)
-                self.log(f"    [{i+1}] {os.path.basename(p)}")
-                self.log(f"        shape={data.shape}  "
-                         f"range=[{np.min(data):.6f}, {np.max(data):.6f}]")
-                panels.append(data)
-
-        self.log(f"\n  Total: SII={len(sii_panels)}, "
-                 f"Ha={len(ha_panels)}, OIII={len(oiii_panels)} panels")
-
-        return sii_panels, ha_panels, oiii_panels
 
     # ── Step 2: Align ───────────────────────────────────────────────────────
 
-    def _step_align(self, sii, ha, oiii):
-        self.step = 2
-        self.log("\n" + "=" * 70)
-        self.log("  STEP 2: Channel Alignment (cv2 2-Pass, Ha reference)")
-        self.log("=" * 70)
-
-        # Check cache first
-        if self._cache_exists('aligned_sii.fit', 'aligned_ha.fit',
-                              'aligned_oiii.fit'):
-            self.log("  [CACHE] Aligned channels found, loading from cache")
-            sii_a = self._cache_load_mono('aligned_sii.fit')
-            ha_a = self._cache_load_mono('aligned_ha.fit')
-            oiii_a = self._cache_load_mono('aligned_oiii.fit')
-
-            # Even cached alignments can become stale/noisy with changing
-            # input selections; refine residual translation each run.
-            sii_a = refine_channel_translation(ha_a, sii_a, 'SII', log=self.log)
-            oiii_a = refine_channel_translation(ha_a, oiii_a, 'OIII', log=self.log)
-
-            for name, data in [("Ha (ref)", ha_a),
-                               ("SII", sii_a), ("OIII", oiii_a)]:
-                self.log(f"    {name:10s}: shape={data.shape}  "
-                         f"range=[{np.min(data):.6f}, {np.max(data):.6f}]")
-
-            self._cache_save_mono('aligned_sii.fit', sii_a)
-            self._cache_save_mono('aligned_oiii.fit', oiii_a)
-            return sii_a, ha_a, oiii_a
-
-        self.log("  Method: cv2 2-pass star registration (asterism + similarity)")
-        self.log("  Reference: Ha (kept un-resampled)")
-
-        # Write channels to temp FITS so align_channels reads via load_fits.
-        align_sii  = os.path.join(self.work_dir, '_align_sii.fit')
-        align_ha   = os.path.join(self.work_dir, '_align_ha.fit')
-        align_oiii = os.path.join(self.work_dir, '_align_oiii.fit')
-        save_fits(sii, align_sii)
-        save_fits(ha, align_ha)
-        save_fits(oiii, align_oiii)
-
-        sii_a, ha_a, oiii_a = align_channels(
-            align_sii, align_ha, align_oiii,
-            self.work_dir, log=self.log)
-
-        # Refine residual per-channel translation to Ha reference.
-        sii_a = refine_channel_translation(ha_a, sii_a, 'SII', log=self.log)
-        oiii_a = refine_channel_translation(ha_a, oiii_a, 'OIII', log=self.log)
-
-        # Ensure matching shapes after alignment
-        shapes = [sii_a.shape, ha_a.shape, oiii_a.shape]
-        if len(set(shapes)) > 1:
-            self.log("  Post-alignment shape mismatch, cropping to common size")
-            min_h = min(s[-2] for s in shapes)
-            min_w = min(s[-1] for s in shapes)
-            sii_a = sii_a[..., :min_h, :min_w]
-            ha_a = ha_a[..., :min_h, :min_w]
-            oiii_a = oiii_a[..., :min_h, :min_w]
-
-        # Save to cache
-        self._cache_save_mono('aligned_sii.fit', sii_a)
-        self._cache_save_mono('aligned_ha.fit', ha_a)
-        self._cache_save_mono('aligned_oiii.fit', oiii_a)
-        self.log("  [CACHE] Saved aligned channels to cache")
-
-        return sii_a, ha_a, oiii_a
 
     # ── Step 3: Normalize ───────────────────────────────────────────────────
 
@@ -2172,11 +2398,17 @@ class SHOPipeline:
         self.log("  STEP 5: Linked Arcsinh Stretch")
         self.log("=" * 70)
         self.log(f"  Target median: {self.stretch_target:.3f}")
-        self.log("  Math: f(x) = arcsinh(beta*x) / arcsinh(beta)")
-        self.log("  Linked = same beta for all channels -> preserves color ratios")
 
-        r_s, g_s, b_s = linked_stretch_rgb(
-            r, g, b, target_median=self.stretch_target, log=self.log)
+        if self.local_stretch_strength > 0:
+            self.log(f"  Locally-adaptive stretch "
+                     f"(strength={self.local_stretch_strength:.2f}) — recovers "
+                     f"local contrast across the mosaic")
+            r_s, g_s, b_s = local_adaptive_stretch(
+                r, g, b, target_median=self.stretch_target,
+                strength=self.local_stretch_strength, log=self.log)
+        else:
+            r_s, g_s, b_s = linked_stretch_rgb(
+                r, g, b, target_median=self.stretch_target, log=self.log)
 
         if not self.truthful_mode:
             r_s, g_s, b_s = tame_blue_stars_pre_starnet(
@@ -2256,6 +2488,15 @@ class SHOPipeline:
         if self.truthful_mode:
             self.log("  Truthful mode: skipping hue-shift and saturation boost")
             return r, g, b
+        # Per-channel SHO balance: lift SII→Red (SII rarely exceeds Ha after a
+        # global normalise, so without this everything collapses to gold) and
+        # OIII→Blue (to restore teal/blue) — the warm/teal SHO variety.
+        if abs(self.sii_boost - 1.0) > 1e-3:
+            self.log(f"  SII red-boost: R x{self.sii_boost:.2f}")
+            r = np.clip(r * self.sii_boost, 0, 1).astype(np.float32)
+        if abs(self.oiii_boost - 1.0) > 1e-3:
+            self.log(f"  OIII blue-boost: B x{self.oiii_boost:.2f}")
+            b = np.clip(b * self.oiii_boost, 0, 1).astype(np.float32)
         r, g, b = hubble_color_refine(r, g, b, strength=self.hue_strength,
                                       oiii_factor=self.oiii_factor, log=self.log)
         r, g, b = boost_saturation(r, g, b, factor=self.sat_boost, log=self.log)
@@ -2309,8 +2550,10 @@ class SHOPipeline:
         starless = np.stack([sl_r, sl_g, sl_b], axis=-1).astype(np.float32)
         stars    = np.stack([st_r, st_g, st_b], axis=-1).astype(np.float32)
 
-        # Scale stars down to reduce their intensity in the blend
-        star_scale = 1.00 if self.truthful_mode else 0.70
+        # Scale stars down to reduce their intensity in the blend (also limits
+        # how much the screen-blend brightens the median, so the nebula stretch
+        # can lift faint structure without the whole image over-exposing).
+        star_scale = 1.00 if self.truthful_mode else float(self.star_scale)
         stars = stars * star_scale
         self.log(f"  Star intensity scaled to {star_scale:.0%}")
 
@@ -2478,7 +2721,10 @@ class SHOPipeline:
             from .plate_solve import plate_solve_if_needed as _plate_solve
             from .plate_solve import update_fits_wcs as _update_wcs
             self.log(f"  Checking output WCS ...")
-            wcs = _plate_solve(fits_path, log_fn=self.log)
+            # Best-effort + time-bounded: stamping WCS on the full mosaic is a
+            # nicety, not essential, and can stall on a busy local solver — keep
+            # it from blocking the rest of the save.
+            wcs = _plate_solve(fits_path, log_fn=self.log, timeout=90)
             if wcs:
                 _update_wcs(fits_path, wcs, log_fn=self.log)
             elif not os.path.isfile(fits_path):

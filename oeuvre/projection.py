@@ -16,7 +16,7 @@ from PIL import Image
 
 from .mosaic_prep import read_fits_header
 from .natural_narrowband import load_fits
-from .plate_solve import plate_solve, update_fits_wcs
+from .plate_solve import plate_solve, plate_solve_if_needed, update_fits_wcs
 
 
 # ── Data structures ─────────────────────────────────────────────────────────
@@ -27,6 +27,7 @@ class SkyFrame:
     __slots__ = (
         'path', 'label',
         'ra_deg', 'dec_deg',
+        '_has_pointing',      # True if RA/DEC or CRVAL1/CRVAL2 found
         'scale_aspp',          # arcsec per pixel
         'width_px', 'height_px',
         'fov_w_deg', 'fov_h_deg',
@@ -51,13 +52,15 @@ class SkyFrame:
         if 'RA' in hdr and 'DEC' in hdr:
             self.ra_deg = float(hdr['RA'])
             self.dec_deg = float(hdr['DEC'])
+            self._has_pointing = True
         elif 'CRVAL1' in hdr and 'CRVAL2' in hdr:
             self.ra_deg = float(hdr['CRVAL1'])
             self.dec_deg = float(hdr['CRVAL2'])
+            self._has_pointing = True
         else:
-            raise ValueError(
-                f"{self.label}: no RA/DEC or CRVAL1/CRVAL2 in header"
-            )
+            self.ra_deg = None
+            self.dec_deg = None
+            self._has_pointing = False
 
         # ── Pixel scale ─────────────────────────────────────────────────
         if 'SECPIX1' in hdr:
@@ -233,22 +236,34 @@ class SkyMap:
     def add_file(self, path, auto_solve=True, log_fn=None):
         """Add a FITS file and return the SkyFrame.
 
-        If the file lacks rotation info (CROTA2 / CD matrix) and
-        *auto_solve* is True, attempt to plate-solve it via the
-        configured astrometry.net API endpoint.
+        If the file lacks pointing metadata, attempt a blind plate solve via
+        the configured astrometry.net API endpoint before giving up.
         """
+        _log = log_fn or print
         sf = SkyFrame(path)
+
+        if not sf._has_pointing:
+            if not auto_solve:
+                raise ValueError(
+                    f"{sf.label}: no RA/DEC or CRVAL1/CRVAL2 in header"
+                )
+            _log(f"  No RA/DEC in header — attempting plate solve...")
+            wcs = plate_solve_if_needed(sf.path, log_fn=_log)
+            if wcs:
+                update_fits_wcs(sf.path, wcs, log_fn=_log)
+                sf._pil_cache = None
+                sf._read_header()
+            if not sf._has_pointing:
+                _log(
+                    f"  Skipping {sf.label}: no pointing data and plate solve "
+                    f"is unavailable"
+                )
+                return None
 
         # Auto plate-solve only if header lacks WCS rotation entirely
         if auto_solve and not sf._has_wcs:
-            _log = log_fn or print
             _log(f"  No WCS in header — attempting plate solve...")
-            from .plate_solve import fits_has_wcs, plate_solve_if_needed
-            if fits_has_wcs(sf.path):
-                _log(f"  WCS already present — skipping plate solve")
-                wcs = None
-            else:
-                wcs = plate_solve_if_needed(sf.path, log_fn=_log)
+            wcs = plate_solve_if_needed(sf.path, log_fn=_log)
             if wcs:
                 update_fits_wcs(sf.path, wcs, log_fn=_log)
                 # Re-read header with fresh WCS

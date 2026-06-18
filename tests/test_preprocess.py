@@ -75,3 +75,24 @@ def test_register_and_stack_roundtrip():
 def test_sum_livetime_handles_missing(tmp_path):
     # No EXPTIME headers / unreadable -> 0, no crash
     assert preprocess._sum_livetime([]) == 0
+
+
+def test_reject_low_quality_drops_cloudy_subs():
+    from oeuvre.preprocess import _reject_low_quality
+    counts = [150, 160, 140, 8, 155, 150, 145, 9]   # idx 3,7 cloudy (few stars)
+    bgs = [0.01] * 8
+    bgs[3] = 0.05                                    # idx 3 also high background
+    keep = _reject_low_quality(counts, bgs, [f's{i}' for i in range(8)],
+                               log=lambda *a: None)
+    assert 3 not in keep and 7 not in keep
+    assert set(keep) == {0, 1, 2, 4, 5, 6}
+
+
+def test_reject_low_quality_keep_floor():
+    from oeuvre.preprocess import _reject_low_quality
+    # All look bad relative to a high-count outlier, but the floor must hold.
+    counts = [3, 3, 3, 3, 100]
+    bgs = [0.01] * 5
+    keep = _reject_low_quality(counts, bgs, [f's{i}' for i in range(5)],
+                               log=lambda *a: None)
+    assert len(keep) >= 5  # min_keep floor → nothing dropped below it

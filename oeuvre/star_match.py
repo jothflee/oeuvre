@@ -26,6 +26,16 @@ import cv2
 from scipy.spatial import cKDTree
 
 
+# Diffuse-nebula suppression for star detection. Subtracting a large-kernel
+# blur removes the smooth emission-nebula background, whose bright gradients
+# otherwise inflate the MAD background sigma (starving the threshold) and seed
+# false centroids from nebula texture. Standard practice for star detection on
+# emission-line fields; on real IC 1805 panels it is the difference between a
+# nebula-heavy panel detecting 9 stars vs 200+, and is what lets both the
+# mosaic matcher and the SHO channel aligner lock onto real stars.
+_HIGHPASS_SIGMA = 8.0
+
+
 def _bg_sigma(img):
     """Robust background level and noise sigma (MAD-based)."""
     v = img[np.isfinite(img)]
@@ -37,15 +47,25 @@ def _bg_sigma(img):
 
 
 def detect_stars(image, max_stars=200, thresh_sigma=5.0,
-                 min_area=2, max_area=120):
+                 min_area=2, max_area=120, highpass_sigma=_HIGHPASS_SIGMA):
     """Detect stars and return flux-weighted sub-pixel centroids.
 
     Works on linear subs or stretched luminance alike (threshold is relative to
     background + k·sigma). Compact-source area filtering rejects nebula blobs.
 
+    A high-pass prefilter (``highpass_sigma`` > 0) subtracts a large-kernel
+    Gaussian blur first, removing diffuse nebula so the threshold tracks the
+    star noise rather than the nebula gradient. Pass ``highpass_sigma=0`` to
+    detect on the raw image.
+
     Returns (xy [N,2] float64 as (x,y), flux [N]) sorted brightest-first.
     """
     img = np.nan_to_num(np.asarray(image, dtype=np.float32))
+    if highpass_sigma and highpass_sigma > 0:
+        blur = cv2.GaussianBlur(img, (0, 0),
+                                sigmaX=float(highpass_sigma),
+                                sigmaY=float(highpass_sigma))
+        img = img - blur
     bg, sig = _bg_sigma(img)
     mask = img > (bg + thresh_sigma * sig)
     if not mask.any():
@@ -113,20 +133,32 @@ def _build_invariants(xy, n_neighbors=6, max_elong=10.0):
     return np.array(invs), tris
 
 
-def match_and_solve(src_img, dst_img, log=print, min_inliers=8,
-                    inv_tol=0.05, max_stars=200):
-    """Match stars between two images via asterism invariants and solve a
-    4-DOF similarity transform (translate + rotate + uniform scale).
+def build_star_model(image, max_stars=200):
+    """Detect stars and precompute their asterism invariants for an image.
+
+    Returns an opaque model (xy, invariants, triangles) reusable across many
+    pairwise matches — detection (incl. the high-pass blur) and invariant
+    construction are the expensive parts, so callers that match one image
+    against many others should build the model once via this and feed it to
+    solve_from_models, rather than calling match_and_solve repeatedly (which
+    re-detects both images every time).
+    """
+    xy, _ = detect_stars(image, max_stars=max_stars)
+    inv, tri = _build_invariants(xy)
+    return (xy, inv, tri)
+
+
+def solve_from_models(src_model, dst_model, log=print, min_inliers=8,
+                      inv_tol=0.05):
+    """Solve a 4-DOF similarity (translate + rotate + uniform scale) from two
+    precomputed star models (see build_star_model).
 
     Returns (M 2x3 mapping src->dst, n_inliers), or (None, 0) on failure.
     """
-    src_xy, _ = detect_stars(src_img, max_stars=max_stars)
-    dst_xy, _ = detect_stars(dst_img, max_stars=max_stars)
+    src_xy, inv_s, tri_s = src_model
+    dst_xy, inv_d, tri_d = dst_model
     if len(src_xy) < 3 or len(dst_xy) < 3:
         return None, 0
-
-    inv_s, tri_s = _build_invariants(src_xy)
-    inv_d, tri_d = _build_invariants(dst_xy)
     if len(inv_s) == 0 or len(inv_d) == 0:
         return None, 0
 
@@ -159,3 +191,19 @@ def match_and_solve(src_img, dst_img, log=print, min_inliers=8,
         log(f"    rejected degenerate transform (scale={scale:.4f})")
         return None, 0
     return M, inliers
+
+
+def match_and_solve(src_img, dst_img, log=print, min_inliers=8,
+                    inv_tol=0.05, max_stars=200):
+    """Match stars between two images via asterism invariants and solve a
+    4-DOF similarity transform (translate + rotate + uniform scale).
+
+    Convenience wrapper that builds both star models then solves. For matching
+    one image against many, build models once and call solve_from_models.
+
+    Returns (M 2x3 mapping src->dst, n_inliers), or (None, 0) on failure.
+    """
+    return solve_from_models(
+        build_star_model(src_img, max_stars=max_stars),
+        build_star_model(dst_img, max_stars=max_stars),
+        log=log, min_inliers=min_inliers, inv_tol=inv_tol)
