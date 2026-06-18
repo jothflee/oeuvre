@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: ./.github/actions/setup-uv
       - run: uv build
       - uses: actions/upload-artifact@v5
         with:
@@ -46,7 +46,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libgl1 libglib2.0-0 python3-tk
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: ./.github/actions/setup-uv
 
       - name: Install managed Python
         run: uv python install 3.12
@@ -128,7 +128,15 @@ jobs:
       - uses: actions/download-artifact@v5
         with:
           path: artifacts
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-          generate_release_notes: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Use GitHub's own CLI (preinstalled on runners) instead of a
+          # third-party action. No checkout in this job, so target the repo
+          # explicitly. --generate-notes mirrors the old auto release notes.
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            $(find artifacts -type f | sort)

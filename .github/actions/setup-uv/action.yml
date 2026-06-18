@@ -1,0 +1,18 @@
+name: Setup uv
+description: >-
+  Install the uv package manager from Astral's official standalone installer.
+  A first-party (in-repo) wrapper so the workflows depend on no third-party
+  GitHub Actions — only GitHub's own actions/* and tooling we control.
+inputs:
+  version:
+    description: uv version to install (pinned for reproducible builds).
+    required: false
+    default: "0.7.8"
+runs:
+  using: composite
+  steps:
+    - name: Install uv ${{ inputs.version }}
+      shell: bash
+      run: |
+        curl -LsSf "https://astral.sh/uv/${{ inputs.version }}/install.sh" | sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
