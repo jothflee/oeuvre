@@ -412,23 +412,25 @@ class OeuvreApp:
 
         # ── Controls card ────────────────────────────────────────────────
         controls, controls_bg = card()
+        self._controls_card = controls
         row = tk.Frame(controls, bg=BG)
-        row.pack(fill='x', padx=16, pady=(14, 6))
+        row.pack(fill='x', padx=16, pady=(14, 8))
         ttk.Label(row, text='Target:').pack(side='left')
         self.target_var = tk.StringVar()
         self.target_combo = ttk.Combobox(
             row, textvariable=self.target_var, state='readonly',
-            font=FONT, width=28)
+            font=FONT, width=24)
         self.target_combo.pack(side='left', padx=(8, 8))
         self.target_combo.bind('<<ComboboxSelected>>', self._on_target_selected)
         ttk.Button(row, text='Browse…', command=self._browse_target).pack(
             side='left', padx=(0, 8))
         ttk.Button(row, text='↻', width=3, command=self._refresh_targets).pack(
             side='left')
-
-        self.info_var = tk.StringVar(value='Select a target to begin')
-        ttk.Label(controls, textvariable=self.info_var,
-                  style='Dim.TLabel').pack(anchor='w', padx=16, pady=(0, 8))
+        # Concise filter feedback lives inline next to the controls (no long
+        # path line) so the card stays compact and fits in the bundle.
+        self.info_var = tk.StringVar(value='Select a target')
+        ttk.Label(row, textvariable=self.info_var, style='Dim.TLabel').pack(
+            side='left', padx=(14, 0))
 
         self.starnet_warning_var = tk.StringVar(value='')
         self.starnet_warning_label = ttk.Label(
@@ -504,6 +506,10 @@ class OeuvreApp:
                           'log': log_bg}
         self._card_photos = {}        # keep PhotoImage refs alive
         cv.bind('<Configure>', self._relayout_proc)
+        # Force a layout pass once the window is realized. In the packaged app
+        # the canvas can miss its first <Configure>, leaving the preview/log
+        # cards stacked at (0,0) and hidden — an explicit relayout avoids that.
+        self.root.after(80, self._relayout_proc)
 
     def _build_settings_tab(self, parent):
         """Settings tab for StarNet setup and astrometry.net API config."""
@@ -689,7 +695,18 @@ class OeuvreApp:
 
     def _proc_boxes(self, w, h):
         """Pixel boxes (x0, y0, x1, y1) for the three panels at size (w, h)."""
-        pad, gap, ctrl_h = 18, 14, 208
+        pad, gap = 18, 14
+        # Size the controls card to the height its content actually needs, so
+        # the run button and sliders are never clipped under system fonts /
+        # HiDPI in the packaged app (the old fixed 208px cut them off there).
+        req = 0
+        card = getattr(self, '_controls_card', None)
+        if card is not None:
+            try:
+                req = card.winfo_reqheight()
+            except Exception:
+                req = 0
+        ctrl_h = min(max(req + 4, 200), max(220, h // 2))
         inner_w = w - 2 * pad
         top = pad + ctrl_h + gap
         bot_h = max(140, h - top - pad)
@@ -1022,7 +1039,7 @@ class OeuvreApp:
         for tname, tpath, tfilters in self._targets:
             if tname == name:
                 filt_str = ', '.join(tfilters) if tfilters else '(scanning…)'
-                self.info_var.set(f'{tpath}  —  Filters: {filt_str}')
+                self.info_var.set(f'Filters: {filt_str}')
                 return
         self.info_var.set('')
 

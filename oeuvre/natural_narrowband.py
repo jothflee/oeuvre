@@ -1843,35 +1843,92 @@ def _alignment_plane(data):
     return np.clip(hp, 0, 1).astype(np.float32)
 
 
-def align_channels(sii_path, ha_path, oiii_path, work_dir, log=print):
-    """Align SHO channels with pure-cv2 2-pass registration (Ha = reference).
+def align_channels(sii_path, ha_path, oiii_path, log=print):
+    """Co-register the three SHO channel masters with the shared star matcher.
 
-    Replaces the former Siril 2-pass + COG step. Ha is forced as the reference
-    so it is never resampled; SII and OIII are warped onto it. Residual
-    sub-pixel translation is polished afterward by refine_channel_translation
-    in the caller. Returns (sii_aligned, ha_aligned, oiii_aligned) as 2D float32.
+    Picks the reference channel by star quality rather than always forcing Ha:
+    Ha is the luminance and is kept un-resampled when it is competitive (within
+    80% of the richest channel's verified-round star count), but when the Ha
+    master is degraded (e.g. a doubled/trailed stack exposes far fewer clean
+    stars) a clean channel becomes the reference so the others still register.
+
+    Each non-reference channel is matched (asterism → phase-correlation),
+    verified by projecting its stars onto the reference, and only warped if the
+    transform holds up. A channel that cannot be registered is left un-warped
+    with a loud warning — never silently emitted at a wrong offset, which is
+    what produces the red/cyan star split. Residual sub-pixel translation is
+    polished afterward by refine_channel_translation in the caller.
+
+    Returns (sii_aligned, ha_aligned, oiii_aligned) as 2D float32.
     """
-    from .preprocess import register_frames
+    from .preprocess import (_phasecorr_translation, _verify_registration,
+                             _refine_transform)
+    from .star_match import build_star_model, solve_from_models
 
     def mono(a):
         return a if a.ndim == 2 else a[0]
 
-    ha = mono(load_fits(ha_path)[0].astype(np.float32))
-    sii = mono(load_fits(sii_path)[0].astype(np.float32))
-    oiii = mono(load_fits(oiii_path)[0].astype(np.float32))
+    chans = {
+        'Ha': mono(load_fits(ha_path)[0].astype(np.float32)),
+        'SII': mono(load_fits(sii_path)[0].astype(np.float32)),
+        'OIII': mono(load_fits(oiii_path)[0].astype(np.float32)),
+    }
+    models = {name: build_star_model(img) for name, img in chans.items()}
+    counts = {name: len(m[0]) for name, m in models.items()}
 
-    # Order [Ha, SII, OIII] and force Ha (index 0) as the reference.
-    aligned, _ = register_frames(
-        [ha, sii, oiii], log=log,
-        labels=['Ha (ref)', 'SII', 'OIII'], ref_idx=0)
-    ha_a, sii_a, oiii_a = aligned
+    # Reference = richest channel, but prefer Ha (the luminance, kept un-resampled)
+    # whenever it is competitive. Only demote Ha when its master is clearly
+    # degraded and exposes far fewer clean stars than the best channel.
+    best = max(counts, key=counts.get)
+    ref_name = 'Ha' if counts['Ha'] >= 0.8 * counts[best] else best
+    log(f"  Channel alignment: reference = {ref_name}  "
+        f"(stars Ha={counts['Ha']} SII={counts['SII']} OIII={counts['OIII']})")
+    if ref_name != 'Ha':
+        log(f"  NOTE: Ha demoted as reference — its master exposes only "
+            f"{counts['Ha']} clean stars vs {counts[best]} in {best}; "
+            f"the Ha stack may be trailed/doubled.")
 
-    # Out-of-frame pixels from warping are NaN; zero them for downstream math.
-    sii_a = np.nan_to_num(sii_a, nan=0.0).astype(np.float32)
-    oiii_a = np.nan_to_num(oiii_a, nan=0.0).astype(np.float32)
-    ha_a = ha_a.astype(np.float32)
+    ref_img = chans[ref_name]
+    ref_xy = models[ref_name][0]
+    h, w = ref_img.shape[:2]
+    min_match = max(8, int(0.05 * len(ref_xy)))
+    # Channels can't be dropped, so the gate only rejects *gross* misalignment
+    # (the red/cyan split). A sub-pixel polish + the caller's
+    # refine_channel_translation tighten the rest.
+    MAX_RESID = 2.0
 
-    for name, data in [("Ha (ref)", ha_a), ("SII", sii_a), ("OIII", oiii_a)]:
+    aligned = {ref_name: ref_img.astype(np.float32)}
+    for name, img in chans.items():
+        if name == ref_name:
+            continue
+        M, inliers = solve_from_models(models[name], models[ref_name], log=log)
+        method = f"asterism ({inliers} inliers)" if M is not None else None
+        if M is None:
+            M = _phasecorr_translation(ref_img, img)
+            if M is not None:
+                method = "phasecorr"
+        if M is not None:
+            M = _refine_transform(M, models[name][0], ref_xy)
+        matched, med = _verify_registration(M, models[name][0], ref_xy)
+        if M is None or matched < min_match or med > MAX_RESID:
+            detail = ('no transform' if M is None
+                      else f'{matched} stars, {med:.2f}px median')
+            log(f"  WARNING: {name} could NOT be registered to {ref_name} "
+                f"({detail}). Leaving {name} un-warped — inspect the {name} "
+                f"master (likely a trailed/doubled or off-field stack).")
+            aligned[name] = np.nan_to_num(img, nan=0.0).astype(np.float32)
+            continue
+        warped = cv2.warpAffine(
+            img, M, (w, h), flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
+        ang = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+        sc = float(np.hypot(M[0, 0], M[1, 0]))
+        log(f"    {name} -> {ref_name}: {method}  dx={M[0,2]:.1f} dy={M[1,2]:.1f} "
+            f"rot={ang:.3f}° scale={sc:.4f} verified={matched}@{med:.2f}px")
+        aligned[name] = np.nan_to_num(warped, nan=0.0).astype(np.float32)
+
+    sii_a, ha_a, oiii_a = aligned['SII'], aligned['Ha'], aligned['OIII']
+    for name, data in [("Ha", ha_a), ("SII", sii_a), ("OIII", oiii_a)]:
         log(f"    {name:10s}: shape={data.shape}  "
             f"range=[{np.min(data):.6f}, {np.max(data):.6f}]")
     return sii_a, ha_a, oiii_a
@@ -1894,7 +1951,7 @@ class SHOPipeline:
                  hubbleize=True, hubbleize_strength=0.45,
                  sii_boost=1.0, oiii_boost=1.0, star_scale=0.70,
                  local_stretch_strength=0.0,
-                 star_consensus='auto'):
+                 star_consensus='auto', log=None):
 
         # Always work with lists of paths (mosaic is the default mode)
         self.sii_paths  = [os.path.abspath(p) for p in sii_paths]
@@ -1938,9 +1995,17 @@ class SHOPipeline:
         self.preview = PipelinePreview(enabled=preview, interactive=interactive)
         self.phase_dir = self.work_dir  # root dir for phase PNGs
         self.step = 0
+        # Where log lines go. Without a callback (CLI) they print to stdout; the
+        # GUI passes its log sink so SHO-stage lines reach the on-screen panel.
+        # (In the windowed .app there is no stdout, so an unwired logger means a
+        # silent log panel — which is exactly what happened before.)
+        self._log_fn = log
 
     def log(self, msg):
-        print(msg)
+        if self._log_fn is not None:
+            self._log_fn(msg)
+        else:
+            print(msg)
 
     def _save_phase_png(self, panel_idx, phase, rgb_hwc):
         """Save a phase PNG to the work directory."""
@@ -2236,8 +2301,8 @@ class SHOPipeline:
             self._cache_save_mono('aligned_oiii.fit', oiii_a)
             return sii_a, ha_a, oiii_a
 
-        self.log("  Method: cv2 2-pass star registration (asterism + similarity)")
-        self.log("  Reference: Ha (kept un-resampled)")
+        self.log("  Method: cv2 star registration (asterism + verification)")
+        self.log("  Reference: best-quality channel (Ha when competitive)")
 
         # Write channels to temp FITS so align_channels reads via load_fits.
         align_sii  = os.path.join(self.work_dir, '_align_sii.fit')
@@ -2248,8 +2313,7 @@ class SHOPipeline:
         save_fits(oiii, align_oiii)
 
         sii_a, ha_a, oiii_a = align_channels(
-            align_sii, align_ha, align_oiii,
-            self.work_dir, log=self.log)
+            align_sii, align_ha, align_oiii, log=self.log)
 
         # Refine residual per-channel translation to Ha reference.
         sii_a = refine_channel_translation(ha_a, sii_a, 'SII', log=self.log)

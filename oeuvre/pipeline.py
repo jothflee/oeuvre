@@ -450,6 +450,7 @@ def run_pipeline(cfg: PipelineConfig):
         hubbleize=cfg.hubbleize,
         hubbleize_strength=cfg.hubbleize_strength,
         star_consensus=star_consensus,
+        log=cfg.log,
     )
 
     # Inject Tk-based preview if provided (replaces cv2 PipelinePreview)

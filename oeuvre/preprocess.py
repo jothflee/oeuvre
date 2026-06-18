@@ -14,9 +14,9 @@ Design notes for parity with Siril:
     scale) via cv2.SIFT + estimateAffinePartial2D + RANSAC — the same machinery
     the mosaic path already trusts. Detection runs on a stretched proxy; the
     transform is applied to the LINEAR data with Lanczos interpolation.
-  - Frames that fail feature matching fall back to phase-correlation translation
-    (mirrors Siril's no-registration fallback), then to unregistered as a last
-    resort.
+  - Frames that fail feature matching fall back to phase-correlation
+    translation; any frame whose transform can't be verified (too few stars
+    land on the reference) is dropped rather than stacked unregistered.
   - Stacking is NaN-masked: pixels outside a warped frame are excluded per-pixel,
     so dithered frames don't darken the master edges (Siril's COG framing
     equivalent).
@@ -61,6 +61,64 @@ def _phasecorr_translation(ref_lin, img_lin, max_shift=200.0):
     if resp < 0.02 or np.hypot(dx, dy) > max_shift:
         return None
     return np.float32([[1, 0, -dx], [0, 1, -dy]])
+
+
+def _refine_transform(M, src_xy, ref_xy, iters=5):
+    """ICP-style sub-pixel polish of a coarse src→ref transform.
+
+    A RANSAC asterism fit (3px inlier threshold) or a phase-correlation shift
+    can sit ~1–2px off — invisible to a loose inlier test but enough to smear
+    the stacked stars. Re-pair each src star with its nearest reference star and
+    re-fit a similarity, tightening the match tolerance each pass, so the
+    transform converges toward sub-pixel where the data allows. Frames that
+    cannot converge are caught by the residual check in verification.
+    """
+    from scipy.spatial import cKDTree
+    if M is None or len(src_xy) < 6 or len(ref_xy) < 6:
+        return M
+    M = np.asarray(M, dtype=np.float64).copy()
+    src = np.asarray(src_xy, dtype=np.float32)
+    ref = np.asarray(ref_xy, dtype=np.float32)
+    tree = cKDTree(ref)
+    tol = 3.0
+    for _ in range(iters):
+        pts = np.column_stack([src, np.ones(len(src))])
+        proj = (M @ pts.T).T[:, :2]
+        dist, idx = tree.query(proj)
+        keep = dist < tol
+        if int(keep.sum()) < 6:
+            break
+        Mr, _ = cv2.estimateAffinePartial2D(
+            src[keep], ref[idx[keep]], method=cv2.RANSAC,
+            ransacReprojThreshold=max(0.5, tol * 0.4))
+        if Mr is None:
+            break
+        M = Mr.astype(np.float64)
+        tol = max(0.6, tol * 0.5)
+    return M.astype(np.float32)
+
+
+def _verify_registration(M, src_xy, ref_xy, tol=2.0):
+    """Measure how well a transform lands src stars on reference stars.
+
+    Returns ``(n_matched_within_tol, median_residual_px)``. Independent
+    confirmation that a transform is both *real* and *tight* — not just that
+    some solver returned one. A correct transform lands many common stars at a
+    sub-pixel median; a bogus one lands almost none, and a merely-coarse one
+    (asterism RANSAC slop, or a frame that genuinely drifted) lands stars but
+    with a large median residual that would smear the stack. Callers drop on
+    both counts: too few matches, or too loose a median.
+    """
+    from scipy.spatial import cKDTree
+    if M is None or len(src_xy) == 0 or len(ref_xy) == 0:
+        return 0, float('inf')
+    pts = np.column_stack([src_xy, np.ones(len(src_xy))])
+    proj = (np.asarray(M, dtype=np.float64) @ pts.T).T[:, :2]
+    dist, _ = cKDTree(np.asarray(ref_xy)).query(proj)
+    near = dist[dist < tol]
+    if len(near) == 0:
+        return 0, float('inf')
+    return int(len(near)), float(np.median(near))
 
 
 def _reject_low_quality(counts, bgs, labels, log, min_keep_frac=0.6,
@@ -116,10 +174,13 @@ def register_frames(frames, log=print, labels=None, ref_idx=None, reject=True):
             the frame with the most stars as the reference (unless ref_idx is
             given). Sub rejection is on for auto-reference stacking only.
     Pass 2: match each frame's asterisms to the reference and warp the LINEAR
-            data with Lanczos. Last-resort fallback is phase-correlation
-            translation, then unregistered.
+            data with Lanczos. Fallback is phase-correlation translation; a
+            frame whose transform can't be verified against the reference stars
+            is dropped (never stacked unregistered).
 
-    Returns (aligned_frames, ref_idx). Pixels outside a warped frame are NaN.
+    Returns (aligned_frames, ref_idx) where ref_idx indexes the returned list
+    (which may be shorter than the input if frames were dropped). Pixels
+    outside a warped frame are NaN.
     """
     from .star_match import build_star_model, solve_from_models
     from .natural_narrowband import _parallel_map, estimate_background
@@ -158,18 +219,32 @@ def register_frames(frames, log=print, labels=None, ref_idx=None, reject=True):
     # frame is independent (matched against the fixed reference model, warped on
     # its own output buffer), so run the whole pass in a thread pool. Results and
     # log lines are reassembled in frame order for deterministic output.
+    #
+    # A frame is registered only if its transform is *verified tight* — enough
+    # of its stars land on reference stars AND their median residual is
+    # sub-pixel. A frame with no transform, a bogus one, or one that only aligns
+    # coarsely (~1px+, e.g. a sub that drifted mid-session) is DROPPED: stacking
+    # it would offset/smear its stars and blur every star in the master.
+    ref_xy = ref_model[0]
+    min_match = max(8, int(0.05 * len(ref_xy)))
+    MAX_RESID = 0.8  # px — median star residual above this smears the stack
+
     def _align(i):
         if i == ref_idx:
-            return frames[i].astype(np.float32), None
+            return frames[i].astype(np.float32), None, True
         M, inliers = solve_from_models(models[i], ref_model, log=lambda *a: None)
         method = f"asterism ({inliers} inliers)" if M is not None else None
         if M is None:
             M = _phasecorr_translation(ref, frames[i])
             if M is not None:
                 method = "phasecorr"
-        if M is None:
-            return (frames[i].astype(np.float32),
-                    f"    {labels[i]}: registration FAILED — stacking unregistered")
+        if M is not None:
+            M = _refine_transform(M, models[i][0], ref_xy)  # sub-pixel polish
+        matched, med = _verify_registration(M, models[i][0], ref_xy)
+        if M is None or matched < min_match or med > MAX_RESID:
+            why = ("no transform found" if M is None
+                   else f"unverified ({matched} stars, {med:.2f}px median)")
+            return None, f"    DROP {labels[i]}: registration failed — {why}", False
         warped = cv2.warpAffine(
             frames[i].astype(np.float32), M, (w, h),
             flags=cv2.INTER_LANCZOS4,
@@ -178,15 +253,26 @@ def register_frames(frames, log=print, labels=None, ref_idx=None, reject=True):
         sc = float(np.hypot(M[0, 0], M[1, 0]))
         return warped, (f"    {labels[i]}: {method}  "
                         f"dx={M[0,2]:.1f} dy={M[1,2]:.1f} "
-                        f"rot={ang:.3f}° scale={sc:.4f}")
+                        f"rot={ang:.3f}° scale={sc:.4f} "
+                        f"verified={matched}@{med:.2f}px"), True
 
     aligned = []
-    for frame_out, msg in _parallel_map(_align, range(n)):
-        aligned.append(frame_out)
+    new_ref_idx = 0
+    dropped = 0
+    for i, (frame_out, msg, ok) in enumerate(_parallel_map(_align, range(n))):
         if msg:
             log(msg)
+        if not ok:
+            dropped += 1
+            continue
+        if i == ref_idx:
+            new_ref_idx = len(aligned)
+        aligned.append(frame_out)
 
-    return aligned, ref_idx
+    if dropped:
+        log(f"  Registration: dropped {dropped} unregisterable frame(s); "
+            f"stacking {len(aligned)}")
+    return aligned, new_ref_idx
 
 
 # ── calibration ─────────────────────────────────────────────────────────────
