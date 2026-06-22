@@ -17,6 +17,15 @@ env:
   # otherwise pick and produce a non-portable bundle.)
   UV_PYTHON_PREFERENCE: only-managed
 
+# Each build job publishes its own outputs straight to the GitHub Release with
+# the preinstalled `gh` CLI (GH_TOKEN), instead of upload-artifact ->
+# download-artifact -> a separate release job. That keeps the workflow free of
+# third-party Node actions (the artifact actions are the only ones still on
+# Node 20). The first build job to run creates the release (with generated
+# notes); the rest see it already exists and just upload. Builds still run on
+# workflow_dispatch (to validate a bundle build); only the tag-gated publish
+# step uploads.
+
 jobs:
   # Pure-Python wheel + sdist (installable on any OS with `pip install`).
   dist:
@@ -25,10 +34,16 @@ jobs:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup-uv
       - run: uv build
-      - uses: actions/upload-artifact@v5
-        with:
-          name: python-dist
-          path: dist/*
+      - name: Publish wheel + sdist to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag \
+            2>/dev/null || true   # ignore "release already exists" (another job won the race)
+          gh release upload "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --clobber
 
   # Standalone, double-clickable bundles (no Python needed) per OS.
   bundle:
@@ -111,32 +126,14 @@ jobs:
             tar czf "${{ matrix.name }}.tar.gz" -C dist Oeuvre
           fi
 
-      - uses: actions/upload-artifact@v5
-        with:
-          name: ${{ matrix.name }}
-          path: |
-            ${{ matrix.name }}.dmg
-            ${{ matrix.name }}.tar.gz
-          if-no-files-found: ignore
-
-  # Attach everything to the GitHub Release (tag pushes only).
-  release:
-    needs: [dist, bundle]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          path: artifacts
-      - name: Publish GitHub Release
+      - name: Publish bundle to release
+        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Use GitHub's own CLI (preinstalled on runners) instead of a
-          # third-party action. No checkout in this job, so target the repo
-          # explicitly. --generate-notes mirrors the old auto release notes.
-          gh release create "${GITHUB_REF_NAME}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes \
-            $(find artifacts -type f | sort)
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" --generate-notes --verify-tag \
+            2>/dev/null || true   # ignore "release already exists" (another job won the race)
+          # Upload whichever artifact this OS produced (.dmg on macOS, .tar.gz on Linux).
+          gh release upload "$GITHUB_REF_NAME" $(ls *.dmg *.tar.gz 2>/dev/null) \
+            --repo "$GITHUB_REPOSITORY" --clobber
