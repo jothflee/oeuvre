@@ -23,7 +23,7 @@ from .mosaic_prep import build_panel_dirs, scan_fits_by_filter
 from .pipeline import run_pipeline, PipelineConfig
 from .projection import SkyMap, SkyFrame
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = [
     "SHOPipeline",
     "build_panel_dirs",
