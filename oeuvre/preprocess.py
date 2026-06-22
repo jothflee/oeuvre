@@ -473,10 +473,11 @@ def _addscale_normalize(frames, ref_idx, log=print):
     return out
 
 
-def _winsorized_sigma_stack(stack, low=3.0, high=3.0, iters=3, reject_sigma=4.5):
+def _winsorized_sigma_stack(stack, low=3.0, high=3.0, iters=3, reject_sigma=4.5,
+                            tile_rows=384):
     """NaN-aware robust sigma-clip mean along axis 0.
 
-    Two stages:
+    Two stages, per pixel:
       1. REJECT extreme single-frame outliers (cosmic rays / hot-pixel hits /
          plane glints) via a MEDIAN + reject_sigma·MAD test, set to NaN. This is
          robust: a lone huge spike doesn't inflate the median/MAD the way it
@@ -487,21 +488,30 @@ def _winsorized_sigma_stack(stack, low=3.0, high=3.0, iters=3, reject_sigma=4.5)
          with few frames, where one outlier isn't diluted away.)
       2. Winsorize the remaining moderate outliers (mean ± kσ clamp) and average,
          keeping the low-noise benefit of winsorizing for ordinary noise.
+
+    Processed in row tiles: the median/abs temporaries on a full-res 40-frame
+    stack would otherwise be several GB and thrash under memory pressure. Tiling
+    bounds peak temporary memory to ~N·tile_rows·W and is numerically identical
+    (every operation is per-pixel along axis 0).
     """
-    data = stack.astype(np.float32, copy=True)
-    # Stage 1: robust rejection of extreme outliers (cosmic rays).
-    med = np.nanmedian(data, axis=0)
-    mad = np.nanmedian(np.abs(data - med), axis=0) * 1.4826
-    mad = np.maximum(mad, 1e-6)
-    data = np.where(np.abs(data - med) > reject_sigma * mad, np.nan, data)
-    # Stage 2: winsorize moderate outliers, NaN-aware.
-    for _ in range(iters):
-        mean = np.nanmean(data, axis=0)
-        std = np.nanstd(data, axis=0)
-        lo = mean - low * std
-        hi = mean + high * std
-        data = np.clip(data, lo, hi)  # clamp; NaNs preserved
-    return np.nanmean(data, axis=0)
+    stack = np.asarray(stack, dtype=np.float32)
+    n, h, w = stack.shape
+    out = np.empty((h, w), dtype=np.float32)
+    for y0 in range(0, h, tile_rows):
+        y1 = min(h, y0 + tile_rows)
+        data = stack[:, y0:y1, :].copy()  # (n, tile, w)
+        # Stage 1: robust rejection of extreme outliers (cosmic rays).
+        med = np.nanmedian(data, axis=0)
+        mad = np.nanmedian(np.abs(data - med), axis=0) * 1.4826
+        np.maximum(mad, 1e-6, out=mad)
+        data[np.abs(data - med) > reject_sigma * mad] = np.nan  # in-place reject
+        # Stage 2: winsorize moderate outliers, NaN-aware.
+        for _ in range(iters):
+            mean = np.nanmean(data, axis=0)
+            std = np.nanstd(data, axis=0)
+            np.clip(data, mean - low * std, mean + high * std, out=data)
+        out[y0:y1, :] = np.nanmean(data, axis=0)
+    return out
 
 
 def stack_frames(aligned, ref_idx, log=print):
