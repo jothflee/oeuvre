@@ -473,26 +473,40 @@ def _addscale_normalize(frames, ref_idx, log=print):
     return out
 
 
-def _winsorized_sigma_stack(stack, low=3.0, high=3.0, iters=3):
-    """Winsorized sigma-clipped mean along axis 0 (Siril rej 3 3), NaN-aware.
+def _winsorized_sigma_stack(stack, low=3.0, high=3.0, iters=3, reject_sigma=4.5):
+    """NaN-aware robust sigma-clip mean along axis 0.
 
-    Winsorizing clamps outliers to the ±kσ boundary (rather than discarding),
-    then averages — Siril's default rejection for deep-sky stacks.
+    Two stages:
+      1. REJECT extreme single-frame outliers (cosmic rays / hot-pixel hits /
+         plane glints) via a MEDIAN + reject_sigma·MAD test, set to NaN. This is
+         robust: a lone huge spike doesn't inflate the median/MAD the way it
+         inflates mean/std — so the spike is flagged on the first pass. (Plain
+         winsorizing with mean/std fails here: one 65k-ADU cosmic ray inflates σ
+         so much that the ±3σ clamp barely touches it, leaving a bright residual
+         that survives into the master as a "shooting-star" streak — especially
+         with few frames, where one outlier isn't diluted away.)
+      2. Winsorize the remaining moderate outliers (mean ± kσ clamp) and average,
+         keeping the low-noise benefit of winsorizing for ordinary noise.
     """
     data = stack.astype(np.float32, copy=True)
+    # Stage 1: robust rejection of extreme outliers (cosmic rays).
+    med = np.nanmedian(data, axis=0)
+    mad = np.nanmedian(np.abs(data - med), axis=0) * 1.4826
+    mad = np.maximum(mad, 1e-6)
+    data = np.where(np.abs(data - med) > reject_sigma * mad, np.nan, data)
+    # Stage 2: winsorize moderate outliers, NaN-aware.
     for _ in range(iters):
         mean = np.nanmean(data, axis=0)
         std = np.nanstd(data, axis=0)
         lo = mean - low * std
         hi = mean + high * std
-        # Clamp (winsorize), preserving NaNs.
-        data = np.clip(data, lo, hi)
+        data = np.clip(data, lo, hi)  # clamp; NaNs preserved
     return np.nanmean(data, axis=0)
 
 
 def stack_frames(aligned, ref_idx, log=print):
     """Normalize (addscale) + Winsorized-σ reject + mean + output normalize."""
-    log(f"  Stacking {len(aligned)} frames (addscale + Winsorized 3σ)")
+    log(f"  Stacking {len(aligned)} frames (addscale + cosmic-ray reject 4.5σ + Winsorized 3σ)")
     norm = _addscale_normalize(aligned, ref_idx, log=log)
     stack = np.stack(norm, axis=0).astype(np.float32)
     master = _winsorized_sigma_stack(stack, 3.0, 3.0)
