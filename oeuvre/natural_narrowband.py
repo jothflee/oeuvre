@@ -49,6 +49,7 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+from scipy import ndimage
 
 from .mosaic_prep import read_fits_header
 from .starnet import remove_stars
@@ -101,7 +102,7 @@ PREVIEW_MAX_DIM   = 1400        # max pixel dimension for preview window
 STRETCH_TARGET    = 0.18        # target median after stretch (0.20–0.30)
 SCNR_AMOUNT       = 1.00       # green removal strength (0.0–1.0)
 STAR_DESAT        = 0.70        # star desaturation amount (0.0–1.0)
-SAT_BOOST         = 1.25        # nebula saturation boost factor
+SAT_BOOST         = 1.00        # nebula saturation boost factor (1.0 = none; was 1.25, over-saturated)
 BG_SAMPLE_FRAC    = 0.15        # fraction of darkest pixels for bg estimation
 
 # CIE 1931 luminance coefficients
@@ -960,7 +961,23 @@ def background_gradient_neutralize(r, g, b, grid=32, bg_pct=20, neb_pct=60,
             np.clip(b - sb * wt, 0, 1).astype(np.float32))
 
 
-def boost_saturation(r, g, b, factor=1.25, signal_floor=0.03, log=print):
+def soft_clip(x, knee=0.80):
+    """Smooth highlight rolloff replacing a hard clip(0, 1).
+
+    Below ``knee`` the value is unchanged; above it the value is tanh-compressed
+    so a channel approaches — but never abruptly slams to — pure 1.0. A hard
+    clip turns an over-saturated pixel into pure single-channel R/G/B (the
+    speckle); this preserves channel ratios near the top so highlights roll off
+    smoothly instead of clipping to primaries.
+    """
+    x = np.asarray(x, dtype=np.float32)
+    out = x.copy()
+    hi = x > knee
+    out[hi] = knee + (1.0 - knee) * np.tanh((x[hi] - knee) / (1.0 - knee))
+    return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+
+def boost_saturation(r, g, b, factor=1.25, signal_floor=0.09, log=print):
     """Boost color saturation in nebula regions while preserving luminosity.
 
     Only enhances pixels above signal_floor to avoid amplifying noise.
@@ -968,6 +985,9 @@ def boost_saturation(r, g, b, factor=1.25, signal_floor=0.03, log=print):
     Math:
       ch_saturated = L + (ch - L) * factor
       Then rescale so L is preserved.
+
+    Output goes through soft_clip (not a hard clip) so the boost can't drive a
+    bright pixel to pure single-channel max.
     """
     log(f"  Saturation boost: {factor:.2f}x (floor={signal_floor:.3f})")
     L = LR * r + LG * g + LB * b
@@ -982,9 +1002,116 @@ def boost_saturation(r, g, b, factor=1.25, signal_floor=0.03, log=print):
     safe = np.maximum(L_new, 1e-10)
     scale = np.where(L_new > 1e-10, L / safe, 1.0)
 
-    return (np.clip(r_b * scale, 0, 1).astype(np.float32),
-            np.clip(g_b * scale, 0, 1).astype(np.float32),
-            np.clip(b_b * scale, 0, 1).astype(np.float32))
+    return (soft_clip(r_b * scale),
+            soft_clip(g_b * scale),
+            soft_clip(b_b * scale))
+
+
+def denoise_chroma_background(r, g, b, lo=0.05, hi=0.16, neb=0.34, med=5,
+                              log=print):
+    """Remove amplified per-channel colour noise from the faint background only.
+
+    The three SHO channels are stacked and stretched independently, so each
+    carries its own background noise; the saturation/hue steps then amplify
+    those into coloured R/G/B speckle across the faint sky. This denoises
+    *colour only* (luminance untouched, so stars/structure stay sharp), and —
+    critically — only in the FAINT regions, so it never flattens the real
+    colour gradients of the nebula (which would give a low-res/posterised look):
+
+      1. Split into luminance L and per-channel chroma (channel − L).
+      2. Faint background (L below `hi`): use median-filtered chroma to kill the
+         coloured grain, and attenuate toward neutral below `lo`.
+      3. Bright nebula (L above `neb`): keep the ORIGINAL chroma untouched, so
+         its colour gradients/detail are fully preserved. Between `hi` and `neb`
+         the two blend smoothly so there's no seam.
+
+    Net: deep sky → neutral, faint sky → denoised colour, nebula → full-detail
+    colour. Earlier this median-filtered the chroma everywhere (including the
+    nebula), which smeared real colour gradients into flat patches.
+    """
+    log(f"  Chroma denoise (faint only: gate {lo:.2f}-{hi:.2f}, "
+        f"preserve nebula >{neb:.2f}, gaussian {med}px)")
+    L = (LR * r + LG * g + LB * b).astype(np.float32)
+    cr, cg, cb = r - L, g - L, b - L  # original chroma (gradients intact)
+    if med and med > 1:
+        # Gaussian (not median): a median quantises chroma into piecewise-flat
+        # patches → posterised/pixelated faint nebula. A Gaussian smooths the
+        # colour noise continuously, so faint regions stay smooth, not blocky.
+        sig = max(0.8, med / 2.0)
+        crm = cv2.GaussianBlur(cr, (0, 0), sig)
+        cgm = cv2.GaussianBlur(cg, (0, 0), sig)
+        cbm = cv2.GaussianBlur(cb, (0, 0), sig)
+    else:
+        crm, cgm, cbm = cr, cg, cb
+    # wn: 0 at hi → 1 at neb. Keep ORIGINAL chroma in the nebula (wn→1),
+    # median-denoised chroma in the faint background (wn→0).
+    wn = np.clip((L - hi) / (neb - hi + 1e-6), 0, 1).astype(np.float32)
+    cr = cr * wn + crm * (1 - wn)
+    cg = cg * wn + cgm * (1 - wn)
+    cb = cb * wn + cbm * (1 - wn)
+    # wbg: attenuate chroma toward neutral in the deep background (below lo).
+    wbg = np.clip((L - lo) / (hi - lo + 1e-6), 0, 1).astype(np.float32)
+    wbg = np.maximum(wbg, wn)  # never attenuate nebula colour
+    return (np.clip(L + cr * wbg, 0, 1).astype(np.float32),
+            np.clip(L + cg * wbg, 0, 1).astype(np.float32),
+            np.clip(L + cb * wbg, 0, 1).astype(np.float32))
+
+
+def neutralize_single_channel_streaks(r, g, b, hp_sigma=2.5, thr=0.018,
+                                      ratio=0.5, star_L=0.45, log=print):
+    """Desaturate compact features present in only ONE channel (the residual
+    coloured "RGB streaks" = walking noise / hot-pixel dashes).
+
+    A compact feature strong in one channel but absent in the other two is not
+    astronomical (real stars are broadband, nebula is diffuse + multi-channel),
+    so pull those pixels toward neutral luminance — the coloured dash blends
+    into the background. Bright stars (L>star_L) and diffuse nebula (low
+    high-pass) are left untouched, so this only removes the stray streaks.
+    """
+    L = (LR * r + LG * g + LB * b).astype(np.float32)
+    def hp(x):
+        return np.abs(x - cv2.GaussianBlur(x.astype(np.float32), (0, 0), hp_sigma))
+    hr, hg, hb = hp(r), hp(g), hp(b)
+    pr, pg, pb = hr > thr, hg > thr, hb > thr
+    support = pr.astype(np.int8) + pg.astype(np.int8) + pb.astype(np.int8)
+    solo = (support == 1) & (L < star_L)
+    n = int(solo.sum())
+    if n == 0:
+        log("  Single-channel streak suppress: none found")
+        return r, g, b
+    m = np.clip(cv2.GaussianBlur(solo.astype(np.float32), (0, 0), 0.8), 0, 1)
+    log(f"  Single-channel streak suppress: {n} px desaturated")
+    return (np.clip(r * (1 - m) + L * m, 0, 1).astype(np.float32),
+            np.clip(g * (1 - m) + L * m, 0, 1).astype(np.float32),
+            np.clip(b * (1 - m) + L * m, 0, 1).astype(np.float32))
+
+
+def despeckle_impulse(r, g, b, thr=0.08, max_L=0.6, log=print):
+    """Final cleanup of isolated impulse pixels (sharp single-pixel spikes).
+
+    A handful of pixels sit far above/below their 3×3 neighbourhood — real
+    dead/hot pixels and cosmic-ray residue (~0.01% of the data) that the stretch
+    makes read as sharp specks against the nebula. Only those spike pixels are
+    replaced with the local 3×3 median (everything else is untouched), so real
+    structure, stars (L≥max_L excluded), and gradients are preserved — this is a
+    targeted spike repair, not a blur.
+    """
+    L = (LR * r + LG * g + LB * b).astype(np.float32)
+    Lm = ndimage.median_filter(L, 3)
+    spike = (np.abs(L - Lm) > thr) & (L < max_L)
+    n = int(spike.sum())
+    if n == 0:
+        log("  Despeckle: no impulse pixels found")
+        return r, g, b
+    m = np.clip(cv2.GaussianBlur(spike.astype(np.float32), (0, 0), 0.6), 0, 1)[..., None]
+    rm = ndimage.median_filter(r, 3)
+    gm = ndimage.median_filter(g, 3)
+    bm = ndimage.median_filter(b, 3)
+    out = np.stack([r, g, b], axis=-1) * (1 - m) + np.stack([rm, gm, bm], axis=-1) * m
+    log(f"  Despeckle: repaired {n} impulse pixels")
+    return (np.clip(out[..., 0], 0, 1).astype(np.float32),
+            np.clip(out[..., 1], 0, 1).astype(np.float32),
+            np.clip(out[..., 2], 0, 1).astype(np.float32))
 
 
 def hubble_color_refine(r, g, b, strength=0.3, oiii_factor=0.38, log=print):
@@ -1753,8 +1880,10 @@ def refine_channel_translation(ref_ha, moving, label, log=print,
                                min_shift_px=0.25, max_shift_px=20.0):
     """Refine residual translational misalignment of a channel to Ha.
 
-    Uses phase correlation on star-emphasized planes, then applies the
-    inverse shift to the moving channel when the shift is plausible.
+    Uses phase correlation on star-emphasized planes, then verifies the proposed
+    shift against detected stars before applying it. Dense nebular fields can
+    produce a plausible-looking correlation peak that makes the star alignment
+    worse, so correlation is treated as a candidate rather than authority.
     """
     ref = _alignment_plane(ref_ha)
     mov = _alignment_plane(moving)
@@ -1772,6 +1901,27 @@ def refine_channel_translation(ref_ha, moving, label, log=print,
         return moving
 
     M = np.float32([[1.0, 0.0, -dx], [0.0, 1.0, -dy]])
+    try:
+        from .preprocess import _verify_registration
+        from .star_match import build_star_model
+
+        ref_xy = build_star_model(ref_ha, max_stars=400)[0]
+        mov_xy = build_star_model(moving, max_stars=400)[0]
+        ident = np.float32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        before_n, before_med = _verify_registration(ident, mov_xy, ref_xy)
+        after_n, after_med = _verify_registration(M, mov_xy, ref_xy)
+        enough = after_n >= max(10, int(0.03 * len(ref_xy)))
+        better_count = after_n > before_n and after_med <= before_med + 0.15
+        better_resid = after_n >= before_n and after_med < before_med - 0.25
+        if not (enough and (better_count or better_resid)):
+            log(f"  Alignment refine ({label}): candidate worsened star check "
+                f"({before_n}@{before_med:.2f}px -> "
+                f"{after_n}@{after_med:.2f}px), skipped")
+            return moving
+    except Exception as exc:
+        log(f"  Alignment refine ({label}): star check failed ({exc}), skipped")
+        return moving
+
     h, w = moving.shape[:2]
     corrected = cv2.warpAffine(
         moving.astype(np.float32), M, (w, h),
@@ -1782,6 +1932,48 @@ def refine_channel_translation(ref_ha, moving, label, log=print,
     log(f"  Alignment refine ({label}): applied dX={-dx:.2f}px dY={-dy:.2f}px "
         f"(raw {dx:.2f},{dy:.2f}, resp={response:.3f})")
     return corrected.astype(np.float32)
+
+
+def _nlm_denoise(ch, h):
+    """Non-local-means denoise one linear channel via a robust 8-bit proxy.
+
+    NL-means preserves coherent structure (nebula, stars) while removing
+    incoherent noise — exactly what's needed to keep a faint emission shell but
+    drop the per-pixel speckle/walking-noise that a low-SNR channel carries.
+    """
+    chf = np.asarray(ch, dtype=np.float32)
+    lo, hi = np.percentile(chf, [0.5, 99.5])
+    rng = float(hi - lo) or 1.0
+    n8 = (np.clip((chf - lo) / rng, 0, 1) * 255).astype(np.uint8)
+    d = cv2.fastNlMeansDenoising(
+        n8, h=float(h), templateWindowSize=7, searchWindowSize=21)
+    return (d.astype(np.float32) / 255.0 * rng + lo).astype(np.float32)
+
+
+def denoise_channels_for_sho(sii, ha, oiii,
+                             h_sii=8.0, h_ha=4.0, h_oiii=12.0, log=print):
+    """NL-means denoise the SHO channels by role before mapping.
+
+    In SHO the channels have a reliable SNR ordering: OIII is the faintest /
+    noisiest (its low-SNR background is the rectified-noise "RGB streaks"), SII
+    is usually weak too, and Ha is the brightest, carrying the luminance detail.
+    So OIII is denoised hard, SII moderately, and Ha only lightly to preserve
+    structure. NL-means keeps coherent signal (the emission shell, stars) and
+    removes the incoherent per-pixel speckle. Strengths are per-role defaults —
+    a faint emission shell survives because it is spatially coherent, while the
+    noise pedestal that the equal-weight stretch would amplify is gone.
+
+    (Heuristic per-role strengths; intended to become a config/SNR-driven knob.)
+    """
+    out = []
+    for ch, name, h in [(sii, 'SII', h_sii), (ha, 'Ha', h_ha),
+                        (oiii, 'OIII', h_oiii)]:
+        if h <= 0:
+            out.append(ch)
+            continue
+        log(f"  {name}: NL-means denoise h={h:.0f}")
+        out.append(_nlm_denoise(ch, h))
+    return out[0], out[1], out[2]
 
 
 def normalize_channels(sii, ha, oiii, log=print):
@@ -1852,17 +2044,18 @@ def align_channels(sii_path, ha_path, oiii_path, log=print):
     master is degraded (e.g. a doubled/trailed stack exposes far fewer clean
     stars) a clean channel becomes the reference so the others still register.
 
-    Each non-reference channel is matched (asterism → phase-correlation),
-    verified by projecting its stars onto the reference, and only warped if the
-    transform holds up. A channel that cannot be registered is left un-warped
-    with a loud warning — never silently emitted at a wrong offset, which is
-    what produces the red/cyan star split. Residual sub-pixel translation is
-    polished afterward by refine_channel_translation in the caller.
+    Each non-reference channel is matched with independent candidates
+    (asterism, dense-star Hough translation, phase-correlation), verified by
+    projecting its stars onto the reference, and only warped if the transform
+    holds up. A channel that cannot be registered is left un-warped with a loud
+    warning - never silently emitted at a wrong offset, which is what produces
+    the red/cyan star split. Residual sub-pixel translation is polished
+    afterward by refine_channel_translation in the caller.
 
     Returns (sii_aligned, ha_aligned, oiii_aligned) as 2D float32.
     """
-    from .preprocess import (_phasecorr_translation, _verify_registration,
-                             _refine_transform)
+    from .preprocess import (_phasecorr_translation, _hough_translation,
+                             _verify_registration, _refine_transform)
     from .star_match import build_star_model, solve_from_models
 
     def mono(a):
@@ -1873,7 +2066,11 @@ def align_channels(sii_path, ha_path, oiii_path, log=print):
         'SII': mono(load_fits(sii_path)[0].astype(np.float32)),
         'OIII': mono(load_fits(oiii_path)[0].astype(np.float32)),
     }
-    models = {name: build_star_model(img) for name, img in chans.items()}
+    # Use a deep star list: the masters are nebula-dominated, so the brightest
+    # couple-hundred detections are largely nebula knots; more stars are needed
+    # to expose enough real common stars for the offset vote (below).
+    models = {name: build_star_model(img, max_stars=400)
+              for name, img in chans.items()}
     counts = {name: len(m[0]) for name, m in models.items()}
 
     # Reference = richest channel, but prefer Ha (the luminance, kept un-resampled)
@@ -1891,40 +2088,55 @@ def align_channels(sii_path, ha_path, oiii_path, log=print):
     ref_img = chans[ref_name]
     ref_xy = models[ref_name][0]
     h, w = ref_img.shape[:2]
-    min_match = max(8, int(0.05 * len(ref_xy)))
-    # Channels can't be dropped, so the gate only rejects *gross* misalignment
-    # (the red/cyan split). A sub-pixel polish + the caller's
-    # refine_channel_translation tighten the rest.
-    MAX_RESID = 2.0
+    min_match = max(12, int(0.05 * len(ref_xy)))
+    MAX_RESID = 2.0  # px: channels can't be dropped; reject only gross failure
 
     aligned = {ref_name: ref_img.astype(np.float32)}
     for name, img in chans.items():
         if name == ref_name:
             continue
-        M, inliers = solve_from_models(models[name], models[ref_name], log=log)
-        method = f"asterism ({inliers} inliers)" if M is not None else None
-        if M is None:
-            M = _phasecorr_translation(ref_img, img)
-            if M is not None:
-                method = "phasecorr"
-        if M is not None:
-            M = _refine_transform(M, models[name][0], ref_xy)
-        matched, med = _verify_registration(M, models[name][0], ref_xy)
-        if M is None or matched < min_match or med > MAX_RESID:
-            detail = ('no transform' if M is None
-                      else f'{matched} stars, {med:.2f}px median')
+        src_xy = models[name][0]
+        # Gather candidate transforms from independent methods and keep the one
+        # that verifies best (most stars at the lowest median residual). Each is
+        # polished to sub-pixel first. Asterism handles rotation; the Hough
+        # offset vote rescues dense nebula fields where asterism/phasecorr fail
+        # (the NGC 2244 case); phase-correlation covers clean small shifts.
+        Ma, inl = solve_from_models(models[name], models[ref_name], log=log)
+        cands = []
+        if Ma is not None:
+            cands.append((Ma, f"asterism({inl})"))
+        Mh = _hough_translation(src_xy, ref_xy)
+        if Mh is not None:
+            cands.append((Mh, "hough"))
+        Mp = _phasecorr_translation(ref_img, img)
+        if Mp is not None:
+            cands.append((Mp, "phasecorr"))
+
+        best = None  # (matched, -med, M, method)
+        for M0, meth in cands:
+            Mr = _refine_transform(M0, src_xy, ref_xy)
+            n, med = _verify_registration(Mr, src_xy, ref_xy)
+            key = (n, -med)
+            if best is None or key > best[:2]:
+                best = (n, -med, Mr, meth, med)
+
+        if best is None or best[0] < min_match or best[4] > MAX_RESID:
+            detail = ('no transform' if best is None
+                      else f'{best[0]} stars, {best[4]:.2f}px median')
             log(f"  WARNING: {name} could NOT be registered to {ref_name} "
                 f"({detail}). Leaving {name} un-warped — inspect the {name} "
                 f"master (likely a trailed/doubled or off-field stack).")
             aligned[name] = np.nan_to_num(img, nan=0.0).astype(np.float32)
             continue
+
+        n, _, M, meth, med = best
         warped = cv2.warpAffine(
             img, M, (w, h), flags=cv2.INTER_LANCZOS4,
             borderMode=cv2.BORDER_CONSTANT, borderValue=np.nan)
         ang = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
         sc = float(np.hypot(M[0, 0], M[1, 0]))
-        log(f"    {name} -> {ref_name}: {method}  dx={M[0,2]:.1f} dy={M[1,2]:.1f} "
-            f"rot={ang:.3f}° scale={sc:.4f} verified={matched}@{med:.2f}px")
+        log(f"    {name} -> {ref_name}: {meth}  dx={M[0,2]:.1f} dy={M[1,2]:.1f} "
+            f"rot={ang:.3f}° scale={sc:.4f} verified={n}@{med:.2f}px")
         aligned[name] = np.nan_to_num(warped, nan=0.0).astype(np.float32)
 
     sii_a, ha_a, oiii_a = aligned['SII'], aligned['Ha'], aligned['OIII']
@@ -2376,6 +2588,12 @@ class SHOPipeline:
                      f"Stars: {stars.shape}")
             self._save_star_debug(panel_idx, starless, stars)
         else:
+            if not self.truthful_mode:
+                self.log("\n" + "=" * 70)
+                self.log("  STEP 3a: Per-channel noise reduction (low-SNR channels)")
+                self.log("=" * 70)
+                sii, ha, oiii = denoise_channels_for_sho(sii, ha, oiii,
+                                                         log=self.log)
             sii_n, ha_n, oiii_n = self._step_normalize(sii, ha, oiii)
             r, g, b             = self._step_map_sho(sii_n, ha_n, oiii_n)
 
@@ -2571,6 +2789,23 @@ class SHOPipeline:
                 log=self.log,
             )
 
+        # Final highlight rolloff: the hue/saturation/hubbleize steps each
+        # hard-clip internally, which leaves pure single-channel pixels. One
+        # soft_clip pass rounds those highlights off without changing midtones.
+        r, g, b = soft_clip(r), soft_clip(g), soft_clip(b)
+
+        # Remove the coloured background speckle the per-channel stretch +
+        # saturation amplifies (colour-only; luminance/stars untouched).
+        r, g, b = denoise_chroma_background(r, g, b, log=self.log)
+
+        # Desaturate the stray single-channel "RGB streaks" (walking noise) that
+        # the chroma denoise leaves in the faint/mid regions.
+        r, g, b = neutralize_single_channel_streaks(r, g, b, log=self.log)
+
+        # Final cleanup: repair isolated impulse pixels (dead/hot/cosmic-ray
+        # specks) with the local median — targeted, structure-preserving.
+        r, g, b = despeckle_impulse(r, g, b, log=self.log)
+
         return r, g, b
 
     # ── Step 9: Star processing ─────────────────────────────────────────────
@@ -2630,6 +2865,13 @@ class SHOPipeline:
                 amount=0.90,
                 log=self.log,
             )
+
+        # Soft highlight rolloff on the recombined image: the screen blend can
+        # drive bright star cores to pure single-channel max. soft_clip rounds
+        # those off (vs a hard clip to primaries) without dimming midtones.
+        final = np.stack([soft_clip(final[:, :, 0]),
+                          soft_clip(final[:, :, 1]),
+                          soft_clip(final[:, :, 2])], axis=-1)
 
         self.log(f"  Final stats: median={np.median(final):.4f} "
                  f"max={np.max(final):.4f}")

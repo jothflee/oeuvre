@@ -72,6 +72,24 @@ def test_register_and_stack_roundtrip():
     assert master.min() >= 0.0 and master.max() <= 1.0
 
 
+def test_hough_translation_finds_offset_amid_distractors():
+    rng = np.random.default_rng(42)
+    shift = np.array([6.5, -17.25])
+    ref_real = rng.uniform(80, 420, size=(36, 2))
+    src_real = ref_real - shift + rng.normal(0, 0.25, size=ref_real.shape)
+
+    ref_noise = rng.uniform(0, 500, size=(180, 2))
+    src_noise = rng.uniform(0, 500, size=(180, 2))
+    ref_xy = np.vstack([ref_real, ref_noise])
+    src_xy = np.vstack([src_real, src_noise])
+
+    M = preprocess._hough_translation(
+        src_xy, ref_xy, max_shift=60.0, bin_px=3.0, min_votes=20)
+
+    assert M is not None
+    assert np.allclose(M[:, 2], shift, atol=0.75)
+
+
 def test_sum_livetime_handles_missing(tmp_path):
     # No EXPTIME headers / unreadable -> 0, no crash
     assert preprocess._sum_livetime([]) == 0

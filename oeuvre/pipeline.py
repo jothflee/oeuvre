@@ -51,11 +51,11 @@ class PipelineConfig:
     oiii_factor: float = 0.15  # gentle cyan→blue (higher dips blues to purple)
     sii_boost: float = 1.0
     oiii_boost: float = 1.0
-    star_scale: float = 0.70  # star intensity in the screen-blend recombine
+    star_scale: float = 0.60  # star intensity in the screen-blend recombine (~15% dimmer than 0.70)
     local_stretch_strength: float = 0.0  # 0=per-panel linked stretch (per-cluster)
     truthful_mode: bool = False
     hubbleize: bool = True
-    hubbleize_strength: float = 0.45
+    hubbleize_strength: float = 0.25  # artistic recolor vividness (was 0.45, over-saturated)
     star_consensus: str = 'auto'
     stack_workers: int = 0  # concurrent (panel,filter) stack jobs; 0 = auto
     log_callback: object = None  # callable(str) for GUI log sink

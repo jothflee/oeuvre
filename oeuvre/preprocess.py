@@ -63,6 +63,46 @@ def _phasecorr_translation(ref_lin, img_lin, max_shift=200.0):
     return np.float32([[1, 0, -dx], [0, 1, -dy]])
 
 
+def _hough_translation(src_xy, ref_xy, max_shift=400.0, bin_px=3.0, min_votes=15):
+    """Robust translation estimate via pairwise-offset voting (a 2-D Hough).
+
+    For dense, nebula-dominated fields (e.g. deep Rosette masters) where the
+    brightest detections are nebula knots, the asterism triangles are ambiguous
+    and phase-correlation locks onto wrong peaks - but the real common stars
+    still agree on one offset. Every src star votes its offset to each nearby
+    ref star; the dominant bin is the true translation. Needs no consistent
+    triangles, just enough common stars, so it survives where the others fail.
+
+    Returns a 2x3 translation matrix (src->ref) or None.
+    """
+    src_xy = np.asarray(src_xy, dtype=np.float64)
+    ref_xy = np.asarray(ref_xy, dtype=np.float64)
+    if len(src_xy) < min_votes or len(ref_xy) < min_votes:
+        return None
+    chunks = []
+    for s in src_xy:
+        d = ref_xy - s
+        m = (np.abs(d[:, 0]) < max_shift) & (np.abs(d[:, 1]) < max_shift)
+        if m.any():
+            chunks.append(d[m])
+    if not chunks:
+        return None
+    offs = np.vstack(chunks)
+    nb = max(1, int(np.ceil(2 * max_shift / bin_px)))
+    Hh, xe, ye = np.histogram2d(offs[:, 0], offs[:, 1], bins=nb,
+                                range=[[-max_shift, max_shift]] * 2)
+    ix, iy = np.unravel_index(int(np.argmax(Hh)), Hh.shape)
+    cx = 0.5 * (xe[ix] + xe[ix + 1])
+    cy = 0.5 * (ye[iy] + ye[iy + 1])
+    in_peak = ((np.abs(offs[:, 0] - cx) <= bin_px)
+               & (np.abs(offs[:, 1] - cy) <= bin_px))
+    votes = int(np.sum(in_peak))
+    if votes < min_votes:
+        return None
+    dx, dy = np.median(offs[in_peak], axis=0)
+    return np.float32([[1, 0, dx], [0, 1, dy]])
+
+
 def _refine_transform(M, src_xy, ref_xy, iters=5):
     """ICP-style sub-pixel polish of a coarse src→ref transform.
 
@@ -165,6 +205,72 @@ def _reject_low_quality(counts, bgs, labels, log, min_keep_frac=0.6,
     return keep
 
 
+def _star_elongation(frame, xy, n=120, half=11):
+    """Median star elongation (major/minor axis ratio) of a frame.
+
+    1.0 = round; larger = trailed/streaked. Measured from the flux second
+    moments of the brightest detected stars. Returns 1.0 (treated as clean) when
+    too few stars are usable, so a sparse frame is never rejected on shape.
+    """
+    f = np.asarray(frame, dtype=np.float32)
+    H, W = f.shape[:2]
+    es = []
+    for x, y in xy[:n]:
+        xi, yi = int(round(x)), int(round(y))
+        if xi < half + 1 or yi < half + 1 or xi >= W - half - 1 or yi >= H - half - 1:
+            continue
+        p = f[yi - half:yi + half + 1, xi - half:xi + half + 1]
+        p = np.clip(p - np.median(p), 0, None)
+        s = float(p.sum())
+        if s <= 0:
+            continue
+        ys, xs = np.indices(p.shape)
+        cx = (xs * p).sum() / s
+        cy = (ys * p).sum() / s
+        sxx = ((xs - cx) ** 2 * p).sum() / s
+        syy = ((ys - cy) ** 2 * p).sum() / s
+        sxy = ((xs - cx) * (ys - cy) * p).sum() / s
+        ev = np.linalg.eigvalsh(np.array([[sxx, sxy], [sxy, syy]]))
+        ev = np.clip(ev, 1e-6, None)
+        es.append(float((ev[1] / ev[0]) ** 0.5))
+    return float(np.median(es)) if len(es) >= 10 else 1.0
+
+
+def _reject_streaked_frames(elongs, labels, log, abs_floor=1.55, sigma=3.0,
+                            min_keep_frac=0.7, min_keep=5):
+    """Flag subs whose stars are streaked (bad guiding/tracking) and return kept.
+
+    A frame is rejected only if its median star elongation is BOTH above an
+    absolute floor (so tight frames are never touched) AND a robust outlier
+    above the session median (med + sigma·MAD). The AND is deliberate: a session
+    that is *uniformly* mildly trailed has no outliers, so none are dropped
+    (culling them would gut the panel) — only genuinely worse frames than their
+    own session go. Keep-floor guards against over-rejection.
+    """
+    n = len(elongs)
+    e = np.asarray(elongs, dtype=float)
+    med = float(np.median(e))
+    mad = float(np.median(np.abs(e - med))) * 1.4826 or 1e-9
+    bad = (e > abs_floor) & (e > med + sigma * mad)
+
+    floor = max(min_keep, int(np.ceil(min_keep_frac * n)))
+    keep = [i for i in range(n) if not bad[i]]
+    if len(keep) < floor:
+        # Too many flagged — keep the roundest `floor`.
+        keep = sorted(int(i) for i in np.argsort(e)[:floor])
+
+    keepset = set(keep)
+    for i in range(n):
+        if i in keepset:
+            continue
+        log(f"    REJECT {labels[i]}: streaked stars "
+            f"(elongation {e[i]:.2f}, session median {med:.2f})")
+    if len(keep) < n:
+        log(f"  Streak rejection: kept {len(keep)}/{n} "
+            f"(dropped {n - len(keep)} streaked)")
+    return keep
+
+
 def register_frames(frames, log=print, labels=None, ref_idx=None, reject=True):
     """2-pass registration of 2D linear frames to a common reference, using the
     shared star-centroid + asterism matcher (oeuvre.star_match).
@@ -199,6 +305,20 @@ def register_frames(frames, log=print, labels=None, ref_idx=None, reject=True):
     if reject and ref_idx is None and n >= 4:
         bgs = _parallel_map(lambda fr: estimate_background(fr)[0], frames)
         keep = _reject_low_quality(counts, bgs, labels, log)
+        if len(keep) < n:
+            frames = [frames[i] for i in keep]
+            models = [models[i] for i in keep]
+            counts = [counts[i] for i in keep]
+            labels = [labels[i] for i in keep]
+            n = len(frames)
+
+    # Streak rejection (bad-guiding frames) — drop subs whose stars are
+    # outlier-trailed relative to the session, so they don't smear the stack.
+    if reject and ref_idx is None and n >= 4:
+        elongs = _parallel_map(
+            lambda fm: _star_elongation(fm[0], fm[1][0]),
+            list(zip(frames, models)))
+        keep = _reject_streaked_frames(elongs, labels, log)
         if len(keep) < n:
             frames = [frames[i] for i in keep]
             models = [models[i] for i in keep]
